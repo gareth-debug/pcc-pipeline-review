@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 
 /* ============================================================================
-   PCC — Pipeline Review
+   Cheeky Pipeline Review
    Weekly 1:1 pipeline health and commit accountability.
 
    All state lives as one JSON blob in Redis under the key "pipeline-review"
@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 2;
+const DATA_VERSION = 5;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -169,16 +169,55 @@ function commitStats(commits, repId, mondayIso) {
 
 /* ------------------------------------------------------------- data model */
 
+/* ---------------------------------------------------------------------------
+   THE MODEL. These figures are locked: nothing in the interface edits them.
+   Changing them means editing this block and redeploying.
+
+   Sized from throughput rather than opinion. Little's Law says what sits in a
+   stage equals the rate flowing through it times how long it sits there. So we
+   start at the activation target, divide back through each stage's conversion
+   rate to get the flow that must enter it, then multiply by dwell time.
+
+   At these conversion rates a $90M book sustains roughly $3.1M activated per
+   month. $4M/month would need about $113M. See Settings for the full working.
+   --------------------------------------------------------------------------- */
+const PER_REP_TARGET = 90e6;         // total pipeline one rep carries
+const ACTIVATION_PER_MONTH = 4e6;    // what the business asks each rep to activate
+
+const STAGE_MODEL = [
+  { id: "st_discovery",      name: "Discovery",         floor: 56e6, dwellDays: 45, conv: 0.35 },
+  { id: "st_evaluation",     name: "Evaluation",        floor: 13e6, dwellDays: 30, conv: 0.45 },
+  { id: "st_negotiation",    name: "Negotiation",       floor: 6e6,  dwellDays: 30, conv: 0.65 },
+  { id: "st_closeplan",      name: "Mutual close plan", floor: 3e6,  dwellDays: 21, conv: 0.85 },
+  { id: "st_implementation", name: "Implementation",    floor: 12e6, dwellDays: 90, conv: 0.95 }
+];
+
 function defaultStages() {
-  /* Floors sum to the coverage target, so clearing every stage floor is the
-     same thing as hitting the overall number. Editable in Settings. */
-  return [
-    { id: "st_discovery", name: "Discovery", floor: 30e6, inCoverage: true },
-    { id: "st_evaluation", name: "Evaluation", floor: 22e6, inCoverage: true },
-    { id: "st_negotiation", name: "Negotiation", floor: 12e6, inCoverage: true },
-    { id: "st_closeplan", name: "Mutual close plan", floor: 6e6, inCoverage: true },
-    { id: "st_implementation", name: "Implementation", floor: 20e6, inCoverage: true }
-  ];
+  return STAGE_MODEL.map((s) => Object.assign({ inCoverage: true }, s));
+}
+
+const WEEKS_PER_MONTH = 13 / 3;      // 4.333
+
+/* Required monthly flow into each stage, working back from the activation
+   target. Also the basis for how much must leave the stage before it. */
+function modelFlows() {
+  const out = new Array(STAGE_MODEL.length);
+  let need = ACTIVATION_PER_MONTH;
+  for (let i = STAGE_MODEL.length - 1; i >= 0; i--) {
+    need = need / STAGE_MODEL[i].conv;
+    out[i] = need;
+  }
+  return out;
+}
+
+/* What must LEAVE a stage each week. Holding a target is only half the job:
+   a full stage that never empties is a blockage, not a healthy book. What has
+   to leave stage N is exactly what has to enter stage N+1; out of the last
+   stage, it is the activation target itself. */
+function weeklyOutflowNeed(idx) {
+  const flows = modelFlows();
+  const monthly = idx < STAGE_MODEL.length - 1 ? flows[idx + 1] : ACTIVATION_PER_MONTH;
+  return monthly / WEEKS_PER_MONTH;
 }
 function defaultReps() {
   return [
@@ -194,7 +233,7 @@ function defaultReps() {
 function defaultData() {
   return {
     meta: { version: DATA_VERSION, updatedAt: Date.now() },
-    config: { coverageTarget: 90e6, stages: defaultStages(), reps: defaultReps() },
+    config: { coverageTarget: PER_REP_TARGET, stages: defaultStages(), reps: defaultReps() },
     targets: {},        /* per-rep, per-stage overrides of the even split */
     current: {},
     commits: [],
@@ -212,13 +251,9 @@ function migrate(raw) {
   d.meta = Object.assign({ version: DATA_VERSION, updatedAt: Date.now() }, input.meta || {});
   d.config = Object.assign({}, base.config, input.config || {});
 
-  const stages = Array.isArray(d.config.stages) && d.config.stages.length ? d.config.stages : defaultStages();
-  d.config.stages = stages.map((s, i) => ({
-    id: s.id || ("st_" + i + "_" + Math.random().toString(36).slice(2, 7)),
-    name: s.name || ("Stage " + (i + 1)),
-    floor: isFinite(Number(s.floor)) ? Number(s.floor) : 0,
-    inCoverage: s.inCoverage !== false
-  }));
+  /* Stages and targets come from the model, not from storage, so an older blob
+     carrying superseded figures is corrected on load rather than honoured. */
+  d.config.stages = defaultStages();
 
   const reps = Array.isArray(d.config.reps) ? d.config.reps : [];
   d.config.reps = reps.map((r, i) => ({
@@ -226,7 +261,7 @@ function migrate(raw) {
     name: r.name || ("Rep " + (i + 1)),
     active: r.active !== false
   }));
-  d.config.coverageTarget = isFinite(Number(d.config.coverageTarget)) ? Number(d.config.coverageTarget) : 0;
+  d.config.coverageTarget = PER_REP_TARGET;
 
   const t = input.targets && typeof input.targets === "object" ? input.targets : {};
   d.targets = {};
@@ -313,16 +348,16 @@ function makeSnapshot(d, weekOf, auto) {
 
 function activeRepsOf(d) { return d.config.reps.filter((r) => r.active !== false); }
 
+/* Each stage's `floor` is what ONE rep is expected to hold in that stage.
+   The team number is that figure multiplied by the active head count, not
+   divided by it. A rep can be given their own figure via d.targets. */
 function repTarget(d, repId, stageId) {
-  const ov = d.targets[repId] && d.targets[repId][stageId];
-  if (ov !== undefined && ov !== null && isFinite(ov)) return Number(ov);
   const st = d.config.stages.filter((s) => s.id === stageId)[0];
-  const n = activeRepsOf(d).length || 1;
-  return st ? (Number(st.floor) || 0) / n : 0;
+  return st ? (Number(st.floor) || 0) : 0;
 }
-function hasOverride(d, repId, stageId) {
-  const ov = d.targets[repId] && d.targets[repId][stageId];
-  return ov !== undefined && ov !== null && isFinite(ov);
+/* What the whole team should be holding in a stage. */
+function teamFloor(d, stage) {
+  return (Number(stage.floor) || 0) * (activeRepsOf(d).length || 1);
 }
 /* The first stage fills from prospecting, not from a named deal crossing over,
    so it never takes inbound commits. */
@@ -346,13 +381,32 @@ function stageFlow(d, repId, idx) {
   const required = gap + pledgedOut;
   const shortfall = Math.max(0, required - pledgedIn);
   const inb = takesInbound(idx);
+
+  /* throughput: what has to cross into the next stage this week */
+  const outNeed = idx < stages.length - 1 ? weeklyOutflowNeed(idx) : weeklyOutflowNeed(idx);
+  const outShort = Math.max(0, outNeed - pledgedOut);
+  const holdOk = cell.gpv >= target;
+
+  /* A stage that is full but not emptying is stuck, and stuck is the thing
+     worth talking about. Filling only takes priority when there is genuinely
+     too little in the stage to push anything out of it. */
+  let state;
+  if (inb && !holdOk && shortfall > 0) state = "short";
+  else if (outShort > 0 && cell.gpv > 0) state = "stuck";
+  else if (!holdOk) state = "short";
+  else if (required > 0 && shortfall <= 0) state = "covered";
+  else state = "ok";
+
   return {
     stage: st, prev, next, idx,
     gpv: cell.gpv, avgDays: cell.avgDays, target,
     inbound, outbound, pledgedIn, pledgedOut,
     gap, required, shortfall,
+    outNeed, outShort, holdOk,
+    monthsOfStock: outNeed > 0 ? cell.gpv / (outNeed * WEEKS_PER_MONTH) : 0,
     isShort: inb ? shortfall > 0 : gap > 0,
-    state: inb ? (shortfall > 0 ? "short" : (required > 0 ? "covered" : "ok")) : (gap > 0 ? "short" : "ok")
+    isStuck: state === "stuck",
+    state
   };
 }
 function sourceLabel(f) { return f.prev ? f.prev.name : "new pipeline"; }
@@ -528,6 +582,7 @@ function buildFocus(d, monday) {
         });
         return;
       }
+      if (f.state === "stuck") return;   /* handled by the movement pass below */
       asks.push({
         k: "bad", sort: f.shortfall, rep: r,
         text: <>needs <em>{fmtMoney(f.shortfall)}</em> into <b>{st.name}</b>
@@ -536,6 +591,21 @@ function buildFocus(d, monday) {
       });
     });
   });
+  /* Movement first: a full stage that will not empty is the thing to fix. */
+  const stucks = [];
+  activeRepsOf(d).forEach((r) => {
+    d.config.stages.forEach((st, i) => {
+      const f = stageFlow(d, r.id, i);
+      if (!f.isStuck) return;
+      stucks.push({
+        k: "bad", sort: f.outShort, rep: r,
+        text: <>is sitting on <em>{fmtMoney(f.gpv)}</em> in <b>{st.name}</b> with only{" "}
+          {fmtMoney(f.pledgedOut)} committed out &mdash; name <em>{fmtMoney(f.outShort)}</em> more
+          into {f.next ? f.next.name : "live"} this week</>
+      });
+    });
+  });
+  stucks.sort((a, b) => b.sort - a.sort);
   asks.sort((a, b) => b.sort - a.sort);
   gaps.sort((a, b) => b.sort - a.sort);
 
@@ -550,15 +620,25 @@ function buildFocus(d, monday) {
     if (commitStats(d.commits, r.id, monday).thisWeek.length === 0) {
       extras.push({ k: "warn", rep: r, text: <>has committed to nothing this week</> });
     }
+    d.config.stages.forEach((st) => {
+      const c = cellOf(d.current, r.id, st.id);
+      if (c.avgDays > 0 && st.dwellDays > 0 && c.avgDays > st.dwellDays * 1.5) {
+        extras.push({
+          k: "warn", rep: r,
+          text: <>is stuck in <b>{st.name}</b> at <em>{Math.round(c.avgDays)} days</em> against an expected {st.dwellDays}</>
+        });
+      }
+    });
   });
-  return asks.slice(0, 5).concat(gaps.slice(0, 2)).concat(extras.slice(0, 3));
+  return stucks.slice(0, 4).concat(asks.slice(0, 3)).concat(gaps.slice(0, 2)).concat(extras.slice(0, 2));
 }
 
 function MasterView({ ctx }) {
   const { data, stages, ids, monday, baseline, actions, onEditing, setTab } = ctx;
   const cur = aggregate(data.current, ids, stages);
   const base = baseline ? aggregate(baseline.reps, ids, stages) : null;
-  const target = Number(data.config.coverageTarget) || 0;
+  const perRepTarget = Number(data.config.coverageTarget) || 0;
+  const target = perRepTarget * ids.length;
   const gap = cur.coverage - target;
   const pct = target > 0 ? (cur.coverage / target) * 100 : 0;
   const covTone = tone(cur.coverage, target);
@@ -570,7 +650,7 @@ function MasterView({ ctx }) {
     trend[st.id] = caps.map((s) => aggregate(s.reps, ids, stages).byStage[st.id].avgDays);
   });
 
-  const scale = Math.max.apply(null, stages.map((st) => Math.max(cur.byStage[st.id].gpv, Number(st.floor) || 0)).concat([1]));
+  const scale = Math.max.apply(null, stages.map((st) => Math.max(cur.byStage[st.id].gpv, teamFloor(data, st))).concat([1]));
   const focus = buildFocus(data, monday);
   const maxTotal = Math.max.apply(null, activeRepsOf(data).map((r) => aggregate(data.current, [r.id], stages).total).concat([1]));
 
@@ -586,6 +666,9 @@ function MasterView({ ctx }) {
               {gap >= 0
                 ? <><span className="over">{fmtMoney(gap)} above</span> the {fmtMoney(target)} target</>
                 : <><span className="short">{fmtMoney(Math.abs(gap))} behind</span> the {fmtMoney(target)} target</>}
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
+                {fmtMoney(perRepTarget)} each across {ids.length} reps
+              </div>
             </div>
           </div>
           <div className="minis">
@@ -631,18 +714,25 @@ function MasterView({ ctx }) {
       </div>
 
       <div className="section">
-        <div className="section-h"><h2>The funnel</h2><span className="hint">notch marks the floor</span></div>
+        <div className="section-h"><h2>The funnel</h2><span className="hint">bar is what is held, the pill is what is moving out this week</span></div>
         <div className="fun-head">
           <div>Stage</div><div />
           <div style={{ textAlign: "right" }}>GPV</div>
-          <div style={{ textAlign: "right" }}>vs floor</div>
+          <div style={{ textAlign: "right" }}>moving out</div>
           <div style={{ textAlign: "right" }}>Avg days</div>
         </div>
         {stages.map((st, i) => {
           const a = cur.byStage[st.id];
-          const b = base ? base.byStage[st.id] : null;
-          const floor = Number(st.floor) || 0;
+          const b0 = base ? base.byStage[st.id] : null;
+          const b = b0 && (b0.gpv > 0 || b0.avgDays > 0) ? b0 : null;
+          const floor = teamFloor(data, st);
           const t = tone(a.gpv, floor);
+          /* what the whole team must push out of this stage this week, and
+             what they have actually committed */
+          const outNeedTeam = weeklyOutflowNeed(i) * ids.length;
+          const movedTeam = data.commits
+            .filter((c) => c.status === "open" && c.fromStage === st.id && ids.indexOf(c.repId) >= 0)
+            .reduce((x, c) => x + (Number(c.gpv) || 0), 0);
           return (
             <div className="fun-row" key={st.id}>
               <div className="fun-name"><span className="idx">{i + 1}</span>{st.name}</div>
@@ -652,12 +742,17 @@ function MasterView({ ctx }) {
                 <div style={{ fontSize: "12px", marginTop: "2px", fontWeight: 600 }}>{b ? <Delta value={a.gpv - b.gpv} /> : null}</div>
               </div>
               <div className="fun-gap">
-                {floor <= 0 ? <Pill tone="flat">no floor</Pill>
-                  : a.gpv < floor ? <Pill tone={t}>{fmtMoney(floor - a.gpv)} short</Pill>
-                    : <Pill tone="good">{fmtMoney(a.gpv - floor)} over</Pill>}
+                {outNeedTeam > 0
+                  ? <Pill tone={movedTeam >= outNeedTeam ? "good" : (movedTeam > 0 ? "warn" : "bad")}>
+                      {fmtMoney(movedTeam)} of {fmtMoney(outNeedTeam)}
+                    </Pill>
+                  : <Pill tone="flat">{"\u2014"}</Pill>}
               </div>
               <div className="fun-days">
-                {fmtDays(a.avgDays)}{b ? <DaysDelta value={a.avgDays - b.avgDays} /> : null}
+                {fmtDays(a.avgDays)}{b && b.avgDays > 0 && a.avgDays > 0 ? <DaysDelta value={a.avgDays - b.avgDays} /> : null}
+                <div className="faint" style={{ fontSize: "11.5px", fontWeight: 600, marginTop: "2px" }}>
+                  {st.dwellDays ? "target " + st.dwellDays + "d" : ""}
+                </div>
                 <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}><Spark points={trend[st.id]} /></div>
               </div>
             </div>
@@ -755,8 +850,8 @@ function MasterView({ ctx }) {
                 })}
                 <tr>
                   <td className="muted">Team floor</td>
-                  {stages.map((st) => <td key={st.id} className="r nar faint">{fmtMoney(st.floor)}</td>)}
-                  <td className="r nar faint">{fmtMoney(stages.reduce((a, s) => a + (Number(s.floor) || 0), 0))}</td>
+                  {stages.map((st) => <td key={st.id} className="r nar faint">{fmtMoney(teamFloor(data, st))}</td>)}
+                  <td className="r nar faint">{fmtMoney(stages.reduce((a, s) => a + teamFloor(data, s), 0))}</td>
                 </tr>
               </tbody>
             </table>
@@ -877,35 +972,41 @@ function RepView({ ctx, rep }) {
             const f = stageFlow(data, rep.id, i);
             const inb = takesInbound(i);
             const b = mb ? mb.byStage[s.id] : null;
+            /* A capture with nothing in it is not a baseline. Comparing against
+               it would report the first week of data entry as a huge jump. */
+            const hasBase = !!b && (b.gpv > 0 || b.avgDays > 0);
             const isOpen = s.id === activeStage;
             const t = tone(f.gpv, f.target);
-            const edge = f.state === "short" ? "bad" : (f.state === "covered" ? "good" : t);
+            const edge = f.state === "short" ? "bad" : (f.state === "stuck" ? "warn" : "good");
 
-            const stateEl = !inb
-              ? (f.gap > 0 ? <Pill tone={t}>{fmtMoney(f.gap)} light</Pill> : <Pill tone="good">on target</Pill>)
-              : f.state === "short" ? <Pill tone="bad">need {fmtMoney(f.shortfall)}</Pill>
-                : f.state === "covered" ? <Pill tone="good">covered</Pill>
-                  : <Pill tone={t}>on target</Pill>;
+            const stateEl =
+              f.state === "stuck" ? <Pill tone="warn">move {fmtMoney(f.outShort)}</Pill>
+                : f.state === "short" ? (inb
+                  ? <Pill tone="bad">need {fmtMoney(f.shortfall)}</Pill>
+                  : <Pill tone="bad">{fmtMoney(f.gap)} light</Pill>)
+                  : f.state === "covered" ? <Pill tone="good">covered</Pill>
+                    : <Pill tone="good">flowing</Pill>;
 
+            const nextName = f.next ? f.next.name : "live";
             let lead;
-            if (!inb) {
-              lead = f.gap > 0
-                ? <><em>{fmtMoney(f.gap)}</em> below target{f.pledgedOut > 0
-                  ? ", and " + fmtMoney(f.pledgedOut) + " is committed out to " + (f.next ? f.next.name : "the next stage") + " \u2014 " + fmtMoney(f.required) + " of new pipeline holds the line"
-                  : " \u2014 needs new pipeline"}.</>
-                : <>On target at <em>{fmtMoney(f.gpv)}</em>{f.pledgedOut > 0
-                  ? ", though " + fmtMoney(f.pledgedOut) + " is leaving for " + (f.next ? f.next.name : "the next stage") + " \u2014 replace it to hold"
-                  : ""}.</>;
-            } else if (f.state === "short") {
+            if (f.state === "stuck") {
+              lead = <>
+                Holding <em>{fmtMoney(f.gpv)}</em>{f.holdOk ? ", which is over the " + fmtMoney(f.target) + " target" : ""} &mdash;
+                the constraint here is movement, not volume. <em>{fmtMoney(f.outNeed)}</em> needs to cross into {nextName} this
+                week and {f.pledgedOut > 0 ? "only " + fmtMoney(f.pledgedOut) + " is committed" : "nothing is committed"}.
+                Name <em>{fmtMoney(f.outShort)}</em> more.
+                {f.monthsOfStock >= 4 ? " At this rate that is " + f.monthsOfStock.toFixed(1) + " months of stock sitting still." : ""}
+              </>;
+            } else if (f.state === "short" && inb) {
               lead = <>Needs <em>{fmtMoney(f.shortfall)}</em> more in from {sourceLabel(f)}{f.pledgedOut > 0
-                ? " \u2014 " + fmtMoney(f.pledgedOut) + " is leaving for " + (f.next ? f.next.name : "the next stage") + ", so holding " + fmtMoney(f.target) + " takes " + fmtMoney(f.required) + " of inflow"
+                ? " \u2014 " + fmtMoney(f.pledgedOut) + " is leaving for " + nextName + ", so holding " + fmtMoney(f.target) + " takes " + fmtMoney(f.required) + " of inflow"
                 : ""}.</>;
+            } else if (f.state === "short") {
+              lead = <><em>{fmtMoney(f.gap)}</em> below the {fmtMoney(f.target)} target and too thin to feed {nextName} &mdash; this one needs prospecting, not a commit.</>;
             } else if (f.state === "covered") {
-              lead = <>Covered: <em>{fmtMoney(f.pledgedIn)}</em> pledged in against {fmtMoney(f.required)} needed.</>;
-            } else if (f.pledgedIn > 0) {
-              lead = <>On target at <em>{fmtMoney(f.gpv)}</em>, with {fmtMoney(f.pledgedIn)} more pledged in.</>;
+              lead = <>Covered: <em>{fmtMoney(f.pledgedIn)}</em> pledged in against {fmtMoney(f.required)} needed, and {fmtMoney(f.pledgedOut)} moving out to {nextName}.</>;
             } else {
-              lead = <>On target at <em>{fmtMoney(f.gpv)}</em> with nothing committed out.</>;
+              lead = <>Holding <em>{fmtMoney(f.gpv)}</em> and pushing <em>{fmtMoney(f.pledgedOut)}</em> into {nextName} this week, against {fmtMoney(f.outNeed)} needed. On track.</>;
             }
 
             return (
@@ -919,8 +1020,13 @@ function RepView({ ctx, rep }) {
                   <span className="st-fig">
                     {fmtMoney(f.gpv)}<span className="of"> / {fmtMoney(f.target)}</span>
                     <span className="st-sub">
+                      {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} out
+                    </span>
+                    <span className="st-sub">
                       {fmtDays(f.avgDays)}
-                      {b ? " " + (f.avgDays - b.avgDays < 0 ? "\u2193" : "\u2191") + Math.abs(Math.round((f.avgDays - b.avgDays) * 10) / 10) : ""}
+                      {hasBase && b.avgDays > 0 && f.avgDays > 0
+                        ? " " + (f.avgDays - b.avgDays < 0 ? "\u2193" : "\u2191") + Math.abs(Math.round((f.avgDays - b.avgDays) * 10) / 10)
+                        : ""}
                     </span>
                   </span>
                   <span className="st-state">{stateEl}</span>
@@ -933,20 +1039,34 @@ function RepView({ ctx, rep }) {
                       <span className="st-f">
                         <label>GPV</label>
                         <MoneyInput value={f.gpv} onEditing={onEditing} onCommit={(v) => actions.setCell(rep.id, s.id, "gpv", v)} />
-                        {b ? <Delta value={f.gpv - b.gpv} /> : null}
+                        {hasBase && b.gpv > 0 ? <Delta value={f.gpv - b.gpv} /> : null}
                       </span>
                       <span className="st-f">
                         <label>avg days</label>
                         <DaysInput value={f.avgDays} onEditing={onEditing} onCommit={(v) => actions.setCell(rep.id, s.id, "avgDays", v)} />
-                        {b ? <DaysDelta value={f.avgDays - b.avgDays} /> : null}
+                        {hasBase && b.avgDays > 0 && f.avgDays > 0 ? <DaysDelta value={f.avgDays - b.avgDays} /> : null}
                       </span>
                       <span className="st-f">
                         <label>target</label>
-                        <MoneyInput className="tgt" value={f.target} onEditing={onEditing}
-                          onCommit={(v) => actions.setRepTarget(rep.id, s.id, v)} />
-                        {hasOverride(data, rep.id, s.id)
-                          ? <button className="btn x" title="Back to the team share" onClick={() => actions.clearRepTarget(rep.id, s.id)}>reset</button>
-                          : <span className="faint" style={{ fontSize: "11px" }}>team share</span>}
+                        <span className="fixed">{fmtMoney(f.target)}</span>
+                      </span>
+                      <span className="st-f">
+                        <label>move out weekly</label>
+                        <span className="fixed">{fmtMoney(f.outNeed)}</span>
+                        <Pill tone={f.outShort > 0 ? "warn" : "good"}>
+                          {fmtMoney(f.pledgedOut)} committed
+                        </Pill>
+                      </span>
+                      <span className="st-f">
+                        <label>expected dwell</label>
+                        <span className="fixed">{s.dwellDays}d</span>
+                        {f.avgDays > 0 && s.dwellDays > 0 ? (
+                          <Pill tone={f.avgDays <= s.dwellDays ? "good" : (f.avgDays <= s.dwellDays * 1.25 ? "warn" : "bad")}>
+                            {f.avgDays <= s.dwellDays
+                              ? "at pace"
+                              : Math.round(f.avgDays - s.dwellDays) + "d slow"}
+                          </Pill>
+                        ) : null}
                       </span>
                     </div>
 
@@ -1046,70 +1166,73 @@ function SettingsView({ ctx }) {
   const { data, stages, actions, onEditing } = ctx;
   const n = activeRepsOf(data).length || 1;
   const floorSum = stages.reduce((a, s) => a + (Number(s.floor) || 0), 0);
-  const matches = floorSum === Number(data.config.coverageTarget);
+  const flows = modelFlows();
   const captures = data.snapshots.slice().sort((a, b) => (b.takenAt || 0) - (a.takenAt || 0));
 
   return (
     <>
       <div className="section">
         <div className="section-h">
-          <h2>Targets</h2>
-          <span className="hint">stage floors split evenly across {n} active reps unless a rep is overridden</span>
+          <h2>The model</h2>
+          <span className="hint">fixed targets, sized from the activation goal &mdash; nothing here is editable</span>
         </div>
-        <table className="tbl" style={{ maxWidth: "660px" }}>
-          <tbody>
-            <tr>
-              <td>Pipeline coverage target</td>
-              <td className="r nar"><MoneyInput value={data.config.coverageTarget} onEditing={onEditing} onCommit={actions.setCoverageTarget} /></td>
-              <td className="muted">Total GPV the team holds at all times</td>
-            </tr>
-            <tr>
-              <td>Stage floors add up to</td>
-              <td className="r nar strong">{fmtMoney(floorSum)}</td>
-              <td>{matches ? <Pill tone="good">matches the target</Pill> : <Pill tone="warn">{fmtMoney(Math.abs(floorSum - data.config.coverageTarget))} {floorSum > data.config.coverageTarget ? "over" : "under"} the target</Pill>}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div className="section">
-        <div className="section-h"><h2>Stages</h2><span className="hint">earliest to latest</span></div>
+        <p className="muted" style={{ marginTop: 0, maxWidth: "740px", fontSize: "14px" }}>
+          Every rep carries <b>{fmtMoney(PER_REP_TARGET)}</b> of pipeline. That is not a round number
+          someone picked: it is what has to sit in the book to activate <b>{fmtMoney(ACTIVATION_PER_MONTH)} a
+          month</b>, given how long deals linger in each stage and how many survive it. Start at
+          activation, divide back through each conversion rate to get the volume that must enter a
+          stage, then multiply by the time it spends there.
+        </p>
         <table className="tbl">
           <thead>
             <tr>
-              <th className="nar">#</th><th>Stage</th><th className="r nar">Team floor</th>
-              <th className="r nar">Per rep</th><th className="nar">In coverage</th><th className="r nar">Order</th>
+              <th>Stage</th>
+              <th className="r nar">Sits for</th>
+              <th className="r nar">Converts at</th>
+              <th className="r nar">So hold</th>
+              <th className="r nar">Move out weekly</th>
+              <th className="r nar">Team of {n}</th>
             </tr>
           </thead>
           <tbody>
-            {stages.map((s, i) => (
-              <tr key={s.id}>
-                <td className="nar faint">{i + 1}</td>
-                <td><TextInput className="in" value={s.name} onEditing={onEditing} onCommit={(v) => actions.setStageName(s.id, v)} /></td>
-                <td className="r nar"><MoneyInput value={s.floor} onEditing={onEditing} onCommit={(v) => actions.setStageFloor(s.id, v)} /></td>
-                <td className="r nar muted">{fmtMoney((Number(s.floor) || 0) / n)}</td>
-                <td className="nar">
-                  <input type="checkbox" checked={s.inCoverage !== false} onChange={(e) => actions.setStageCoverage(s.id, e.target.checked)} />
-                </td>
-                <td className="r nar">
-                  <div className="acts">
-                    <button className="btn x" disabled={i === 0} onClick={() => actions.moveStage(s.id, -1)}>↑</button>
-                    <button className="btn x" disabled={i === stages.length - 1} onClick={() => actions.moveStage(s.id, 1)}>↓</button>
-                    <button className="btn x" title="Remove stage" onClick={() => actions.removeStage(s.id)}>×</button>
-                  </div>
-                </td>
+            {stages.map((st, i) => (
+              <tr key={st.id}>
+                <td><span className="idx">{i + 1}</span> {st.name}</td>
+                <td className="r nar muted">{st.dwellDays}d</td>
+                <td className="r nar muted">{Math.round(st.conv * 100)}%</td>
+                <td className="r nar strong">{fmtMoney(st.floor)}</td>
+                <td className="r nar strong">{fmtMoney(weeklyOutflowNeed(i))}</td>
+                <td className="r nar muted">{fmtMoney(teamFloor(data, st))} held, {fmtMoney(weeklyOutflowNeed(i) * n)}/wk out</td>
               </tr>
             ))}
+            <tr>
+              <td className="strong">Per rep</td>
+              <td className="r nar muted">{stages.reduce((a, x) => a + (x.dwellDays || 0), 0)}d total</td>
+              <td className="r nar muted">{(stages.reduce((a, x) => a * (x.conv || 1), 1) * 100).toFixed(1)}% overall</td>
+              <td className="r nar strong">{fmtMoney(floorSum)}</td>
+              <td className="r nar" />
+              <td className="r nar strong">{fmtMoney(stages.reduce((a, x) => a + teamFloor(data, x), 0))} held</td>
+            </tr>
           </tbody>
         </table>
-        <div className="row-acts">
-          <button className="btn primary" onClick={actions.addStage}>Add stage</button>
-          <span className="faint">Removing a stage hides it everywhere but leaves its numbers in past captures.</span>
-        </div>
+        <p className="muted" style={{ marginTop: "14px", maxWidth: "740px", fontSize: "13.5px" }}>
+          Implementation is pinned at three months&rsquo; cover, since a signed deal still takes about{" "}
+          {STAGE_MODEL[4].dwellDays} days to go live. The four earlier stages are scaled so the total
+          lands on {fmtMoney(PER_REP_TARGET)}.
+        </p>
+        <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
+          <b>The holding figure is the easier half.</b> A stage that is full but never empties is a
+          blockage, not a healthy book, so each stage also has a weekly movement requirement: what has to
+          leave it is exactly what has to enter the next one. Discovery is where that bites &mdash;{" "}
+          <b>{fmtMoney(weeklyOutflowNeed(0))} has to cross into Evaluation every week, per rep</b>. A rep
+          holding {fmtMoney(PER_REP_TARGET * 0.75)} in Discovery who commits nothing out is not ahead of
+          target, they are months of stock standing still, and the app marks that stage as stuck rather
+          than green.
+        </p>
       </div>
 
       <div className="section">
-        <div className="section-h"><h2>Reps</h2><span className="hint">unticking keeps history but drops them from totals and re-splits the floors</span></div>
+        <div className="section-h"><h2>Reps</h2><span className="hint">unticking keeps history and drops them from the team total, but every active rep still carries the full per-rep target</span></div>
         <table className="tbl">
           <thead>
             <tr><th>Name</th><th className="nar">Active</th><th className="r nar">Pipeline</th><th className="r nar">Target</th><th className="r nar">Gap</th><th className="r nar" /></tr>
@@ -1134,7 +1257,6 @@ function SettingsView({ ctx }) {
         </table>
         <div className="row-acts">
           <button className="btn primary" onClick={actions.addRep}>Add rep</button>
-          <button className="btn" onClick={actions.clearAllTargets}>Reset every per-rep target override</button>
         </div>
       </div>
 
@@ -1216,7 +1338,7 @@ function buildSample(d) {
   const mon = thisMonday();
   const wk = (n) => isoDate(new Date(mondayOf(new Date()).getTime() - n * 7 * 864e5));
   const s = d.config.stages;
-  const id = (i) => (s[i] ? s[i].id : "");
+  const id = (i) => (s[i] ? s[i].id : "");   /* stage ids come from the model */
   d.current = sampleBoard(d, SAMPLE_NOW);
   const last = sampleBoard(d, SAMPLE_LAST);
   const floors = {};
@@ -1440,38 +1562,6 @@ export default function App() {
         d.current[repId].note = text;
       });
     },
-    setCoverageTarget(v) { update((d) => { d.config.coverageTarget = v; }); },
-    setStageFloor(id, v) { update((d) => { const s = d.config.stages.find((x) => x.id === id); if (s) s.floor = v; }); },
-    setStageName(id, v) { update((d) => { const s = d.config.stages.find((x) => x.id === id); if (s) s.name = v || s.name; }); },
-    setStageCoverage(id, on) { update((d) => { const s = d.config.stages.find((x) => x.id === id); if (s) s.inCoverage = !!on; }); },
-    moveStage(id, dir) {
-      update((d) => {
-        const i = d.config.stages.findIndex((s) => s.id === id);
-        const j = i + dir;
-        if (i < 0 || j < 0 || j >= d.config.stages.length) return;
-        const a = d.config.stages;
-        const t = a[i]; a[i] = a[j]; a[j] = t;
-      });
-    },
-    addStage() { update((d) => { d.config.stages.push({ id: uid("st"), name: "New stage", floor: 0, inCoverage: true }); }); },
-    removeStage(id) {
-      const s = dataRef.current.config.stages.find((x) => x.id === id);
-      if (!window.confirm("Remove " + (s ? s.name : "this stage") + "? Past captures keep their numbers.")) return;
-      update((d) => { d.config.stages = d.config.stages.filter((x) => x.id !== id); });
-    },
-    setRepTarget(repId, stageId, v) {
-      update((d) => {
-        if (!d.targets[repId]) d.targets[repId] = {};
-        d.targets[repId][stageId] = v;
-      });
-    },
-    clearRepTarget(repId, stageId) {
-      update((d) => { if (d.targets[repId]) delete d.targets[repId][stageId]; });
-    },
-    clearAllTargets() {
-      if (!window.confirm("Reset every per-rep target back to an even split of the stage floors?")) return;
-      update((d) => { d.targets = {}; });
-    },
     addRep() {
       update((d) => {
         const id = uid("rep");
@@ -1567,7 +1657,7 @@ export default function App() {
       <header className="head">
         <div className="head-top">
           <div className="brand">
-            <h1>Pipeline Review</h1>
+            <h1>Cheeky Pipeline Review</h1>
             <span className="wk">
               Week of {shortDate(monday)}{baseline ? " \u00b7 baseline " + shortDate(baseline.weekOf) : ""}
             </span>
@@ -1828,7 +1918,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .st-tick{position:absolute;top:-4px;bottom:-4px;width:3px;border-radius:2px;background:var(--ink)}
 .st-fig{text-align:right;font-size:15px;font-weight:700;letter-spacing:-.02em}
 .st-fig .of{color:var(--faint);font-size:13px;font-weight:600}
-.st-sub{font-size:12.5px;color:var(--faint);margin-top:2px;font-weight:600}
+.st-sub{display:block;font-size:12.5px;color:var(--faint);margin-top:3px;font-weight:600;white-space:nowrap}
 .st-state{text-align:right}
 .st-body{padding:4px 18px 20px 18px;border-top:1px solid var(--line);background:var(--card)}
 .st-lead{font-size:14.5px;color:var(--ink-2);margin:16px 0;max-width:660px;font-weight:500}
@@ -1839,6 +1929,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
+.fixed{font-size:14px;font-weight:700;color:var(--ink);white-space:nowrap}
 .tgt{background:none;border:0;border-bottom:2px dashed #D3DBE8;padding:3px 2px;font:inherit;font-size:14px;
   font-weight:700;color:var(--slate);cursor:text;width:84px;text-align:right}
 .tgt:hover{border-bottom-color:var(--slate);color:var(--ink)}
