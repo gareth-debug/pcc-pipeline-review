@@ -716,8 +716,8 @@ function buildFocus(d, monday) {
         const h = impactHorizon(i);
         light.push({
           k: "warn", sort: f.lightBy, rep: r,
-          text: <>has a thin <b>{st.name}</b> at {fmtMoney(f.gpv)} of {fmtMoney(f.target)} &mdash;
-            lands in activation around <em>{h.label}</em></>
+          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b>, and what goes in now activates
+            around {h.label} &mdash; a <em>{h.months.toFixed(1)}-month</em> lead time, so it has to start this week</>
         });
       }
     });
@@ -905,8 +905,8 @@ function MasterView({ ctx }) {
                   {fmtMoney(movedTeam)} of {fmtMoney(outNeedTeam)}
                 </Pill>
                 {a.gpv < floor * 0.6 ? (
-                  <div className="faint" style={{ fontSize: "11px", fontWeight: 600, marginTop: "4px" }}>
-                    thin &middot; bites {impactHorizon(i).label}
+                  <div style={{ fontSize: "11px", fontWeight: 700, marginTop: "4px", color: "var(--warn)" }}>
+                    thin &middot; {impactHorizon(i).months.toFixed(1)}m lead time
                   </div>
                 ) : null}
               </div>
@@ -1172,7 +1172,7 @@ function RepView({ ctx, rep }) {
                   </span>
                   <span className="st-state">
                     {stateEl}
-                    {f.hole ? <span className="st-risk-dot" title={"Thin: shows up in activation around " + impactHorizon(i).label} /> : null}
+                    {f.hole ? <span className="st-risk-dot" title={"Thin by " + fmtMoney(f.lightBy) + ". What enters now activates around " + impactHorizon(i).label + ", so closing it starts this week."} /> : null}
                   </span>
                 </button>
 
@@ -1181,9 +1181,13 @@ function RepView({ ctx, rep }) {
                     <p className={"st-lead " + f.state}>{lead}</p>
                     {f.hole ? (
                       <p className="st-risk">
-                        Holding {fmtMoney(f.gpv)} against {fmtMoney(f.target)}. Not this week&rsquo;s problem &mdash;
-                        a thin {s.name} shows up in activation around <b>{impactHorizon(i).label}</b>
-                        {inb ? ", and gets filled from " + sourceLabel(f) : ", and needs new pipeline"}.
+                        <b>{fmtMoney(f.lightBy)} light</b> here, holding {fmtMoney(f.gpv)} of {fmtMoney(f.target)}.
+                        {" "}What enters {s.name} now is what activates around <b>{impactHorizon(i).label}</b>, so the{" "}
+                        {impactHorizon(i).months.toFixed(1)}-month lead time is the reason to close this
+                        <b> now</b>, not later.
+                        {inb
+                          ? " It fills from " + sourceLabel(f) + ", which is this week's job in that stage."
+                          : " It fills from prospecting, so the work starts this week."}
                       </p>
                     ) : null}
                     <div className="st-fields">
@@ -1384,10 +1388,10 @@ function SettingsView({ ctx }) {
         <p className="muted" style={{ marginTop: "14px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>Shape is not scored.</b> A dollar in Mutual close plan is worth roughly ten in Discovery, so a
           rep who is heavy late and light in the middle is ahead, not behind, and the headline reflects
-          that. What a thin stage does earn is a dated note: deals that should be crossing it now are the
-          ones that activate months from now, so the app says when the gap lands rather than marking the
-          week down. Signed business and unsold pipeline are reported separately, because a full
-          implementation queue can otherwise hide a selling motion that has stopped.
+          that. A thin stage is still called out, with its lead time attached: what crosses into a stage
+          now is what activates months later, so a long lead time is a reason to close the gap this week
+          rather than a reason it can wait. Signed business and unsold pipeline are reported separately,
+          because a full implementation queue can otherwise hide a selling motion that has stopped.
         </p>
         <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>The holding figure is the easier half.</b> A stage that is full but never empties is a
