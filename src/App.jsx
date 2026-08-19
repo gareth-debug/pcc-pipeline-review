@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 6;
+const DATA_VERSION = 7;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -414,6 +414,43 @@ function stageFlow(d, repId, idx) {
 }
 function sourceLabel(f) { return f.prev ? f.prev.name : "new pipeline"; }
 
+/* --------------------------------------------------------- days trends */
+
+/* Captures are keyed to Mondays, so a window is just a number of Mondays back.
+   Looking back 1 gives the change over the past week, 4 the past month, 12 the
+   past quarter. Falls back to the nearest capture within a week if a Monday
+   was missed, and reports nothing at all rather than guessing. */
+const TREND_WINDOWS = [1, 2, 4, 12];
+
+function captureWeeksBack(snapshots, mondayIso, weeks) {
+  const caps = weeklyCaptures(snapshots);
+  if (!caps.length) return null;
+  const wantTime = new Date(mondayIso + "T00:00:00").getTime() - (weeks - 1) * 7 * 864e5;
+  let best = null, bestDiff = Infinity;
+  caps.forEach((c) => {
+    const t = new Date(c.weekOf + "T00:00:00").getTime();
+    const diff = Math.abs(t - wantTime);
+    /* Captures land on Mondays, so anything not within a few days of the
+       wanted Monday belongs to a different window. Borrowing a neighbouring
+       week would label the same change as two different periods. */
+    if (diff <= 3 * 864e5 && diff < bestDiff) { bestDiff = diff; best = c; }
+  });
+  return best;
+}
+
+/* Percentage change in days-in-stage across each window. Down is good. */
+function daysTrends(d, repIds, stageId, mondayIso) {
+  const stages = d.config.stages;
+  const now = aggregate(d.current, repIds, stages).byStage[stageId].avgDays;
+  return TREND_WINDOWS.map((w) => {
+    const cap = captureWeeksBack(d.snapshots, mondayIso, w);
+    if (!cap) return { weeks: w, ok: false };
+    const then = aggregate(cap.reps, repIds, stages).byStage[stageId].avgDays;
+    if (!(then > 0) || !(now > 0)) return { weeks: w, ok: false };
+    return { weeks: w, ok: true, pct: ((now - then) / then) * 100, then, weekOf: cap.weekOf };
+  });
+}
+
 /* ---------------------------------------------------------------- atoms */
 
 function MoneyInput({ value, onCommit, onEditing, className }) {
@@ -496,11 +533,6 @@ function Delta({ value }) {
   );
 }
 
-function DaysDelta({ value }) {
-  const v = Math.round((Number(value) || 0) * 10) / 10;
-  if (!v) return <span className="days-d">{"\u2014"}</span>;
-  return <span className={"days-d " + (v < 0 ? "good" : "bad")}>{v < 0 ? "\u2193" : "\u2191"}{Math.abs(v)}</span>;
-}
 
 function StageSelect({ value, stages, onChange, onEditing }) {
   return (
@@ -535,6 +567,27 @@ function Gauge({ pct, tone: t }) {
       <text className="gauge-pct" x={cx} y={cy - 16} textAnchor="middle">{Math.round(pct)}%</text>
       <text className="gauge-lab" x={cx} y={cy + 2} textAnchor="middle">OF TARGET</text>
     </svg>
+  );
+}
+
+/* Down is good: deals are clearing the stage faster than they were. */
+function DaysTrend({ trends, compact }) {
+  const shown = trends.filter((t) => t.ok);
+  if (!shown.length) return <span className="faint" style={{ fontSize: "12px", fontWeight: 600 }}>no history yet</span>;
+  return (
+    <span className="trend">
+      {(compact ? shown.slice(0, 3) : shown).map((t) => {
+        const flat = Math.abs(t.pct) < 1;
+        const cls = flat ? "flat" : (t.pct < 0 ? "good" : "bad");
+        return (
+          <span key={t.weeks} className={"tchip " + cls}
+            title={"vs " + shortDate(t.weekOf) + ", when it was " + fmtDays(t.then)}>
+            <b>{t.weeks}w</b>
+            {flat ? " \u2014" : (t.pct < 0 ? " \u2193" : " \u2191") + Math.abs(Math.round(t.pct)) + "%"}
+          </span>
+        );
+      })}
+    </span>
   );
 }
 
@@ -604,12 +657,15 @@ function buildFocus(d, monday) {
     if (commitStats(d.commits, r.id, monday).thisWeek.length === 0) {
       extras.push({ k: "warn", rep: r, text: <>has named nothing to move this week</> });
     }
+    /* Direction of travel beats an absolute number: a stage getting slower
+       over a month is worth raising whatever the headline figure is. */
     d.config.stages.forEach((st) => {
-      const c = cellOf(d.current, r.id, st.id);
-      if (c.avgDays > 0 && st.dwellDays > 0 && c.avgDays > st.dwellDays * 1.5) {
+      const t = daysTrends(d, [r.id], st.id, monday).filter((x) => x.ok && x.weeks === 4)[0];
+      if (t && t.pct >= 15) {
         extras.push({
           k: "warn", rep: r,
-          text: <>is stuck in <b>{st.name}</b> at <em>{Math.round(c.avgDays)} days</em> against an expected {st.dwellDays}</>
+          text: <><b>{st.name}</b> has slowed <em>{Math.round(t.pct)}%</em> over four weeks,
+            from {fmtDays(t.then)} to {fmtDays(cellOf(d.current, r.id, st.id).avgDays)}</>
         });
       }
     });
@@ -703,7 +759,7 @@ function MasterView({ ctx }) {
           <div>Stage</div><div />
           <div style={{ textAlign: "right" }}>GPV</div>
           <div style={{ textAlign: "right" }}>moving out</div>
-          <div style={{ textAlign: "right" }}>Avg days</div>
+          <div style={{ textAlign: "right" }}>Median days in stage</div>
         </div>
         {stages.map((st, i) => {
           const a = cur.byStage[st.id];
@@ -733,11 +789,11 @@ function MasterView({ ctx }) {
                   : <Pill tone="flat">{"\u2014"}</Pill>}
               </div>
               <div className="fun-days">
-                {fmtDays(a.avgDays)}{b && b.avgDays > 0 && a.avgDays > 0 ? <DaysDelta value={a.avgDays - b.avgDays} /> : null}
-                <div className="faint" style={{ fontSize: "11.5px", fontWeight: 600, marginTop: "2px" }}>
-                  {st.dwellDays ? "target " + st.dwellDays + "d" : ""}
+                {fmtDays(a.avgDays)}
+                <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}>
+                  <DaysTrend trends={daysTrends(data, ids, st.id, monday)} compact />
                 </div>
-                <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}><Spark points={trend[st.id]} /></div>
+                <div style={{ marginTop: "3px", display: "flex", justifyContent: "flex-end" }}><Spark points={trend[st.id]} /></div>
               </div>
             </div>
           );
@@ -994,10 +1050,12 @@ function RepView({ ctx, rep }) {
                       {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} out
                     </span>
                     <span className="st-sub">
-                      {fmtDays(f.avgDays)}
-                      {hasBase && b.avgDays > 0 && f.avgDays > 0
-                        ? " " + (f.avgDays - b.avgDays < 0 ? "\u2193" : "\u2191") + Math.abs(Math.round((f.avgDays - b.avgDays) * 10) / 10)
-                        : ""}
+                      {fmtDays(f.avgDays)} in stage
+                      {(() => {
+                        const t = daysTrends(data, [rep.id], s.id, monday).filter((x) => x.ok)[0];
+                        if (!t || Math.abs(t.pct) < 1) return "";
+                        return (t.pct < 0 ? " \u2193" : " \u2191") + Math.abs(Math.round(t.pct)) + "% 1w";
+                      })()}
                     </span>
                   </span>
                   <span className="st-state">{stateEl}</span>
@@ -1013,9 +1071,9 @@ function RepView({ ctx, rep }) {
                         {hasBase && b.gpv > 0 ? <Delta value={f.gpv - b.gpv} /> : null}
                       </span>
                       <span className="st-f">
-                        <label>avg days</label>
+                        <label>median days in stage</label>
                         <DaysInput value={f.avgDays} onEditing={onEditing} onCommit={(v) => actions.setCell(rep.id, s.id, "avgDays", v)} />
-                        {hasBase && b.avgDays > 0 && f.avgDays > 0 ? <DaysDelta value={f.avgDays - b.avgDays} /> : null}
+                        <DaysTrend trends={daysTrends(data, [rep.id], s.id, monday)} />
                       </span>
                       <span className="st-f">
                         <label>target</label>
@@ -1027,17 +1085,6 @@ function RepView({ ctx, rep }) {
                         <Pill tone={f.outShort > 0 ? "warn" : "good"}>
                           {fmtMoney(f.pledgedOut)} committed
                         </Pill>
-                      </span>
-                      <span className="st-f">
-                        <label>expected dwell</label>
-                        <span className="fixed">{s.dwellDays}d</span>
-                        {f.avgDays > 0 && s.dwellDays > 0 ? (
-                          <Pill tone={f.avgDays <= s.dwellDays ? "good" : (f.avgDays <= s.dwellDays * 1.25 ? "warn" : "bad")}>
-                            {f.avgDays <= s.dwellDays
-                              ? "at pace"
-                              : Math.round(f.avgDays - s.dwellDays) + "d slow"}
-                          </Pill>
-                        ) : null}
                       </span>
                     </div>
 
@@ -1894,6 +1941,12 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
+.trend{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center}
+.tchip{font-size:11.5px;font-weight:700;padding:2px 7px;border-radius:999px;background:var(--paper);color:var(--slate);white-space:nowrap}
+.tchip b{font-weight:800;opacity:.55;margin-right:1px}
+.tchip.good{background:var(--good-bg);color:var(--good)}
+.tchip.bad{background:var(--bad-bg);color:var(--bad)}
+.tchip.flat{background:var(--paper);color:var(--faint)}
 .fixed{font-size:14px;font-weight:700;color:var(--ink);white-space:nowrap}
 .tgt{background:none;border:0;border-bottom:2px dashed #D3DBE8;padding:3px 2px;font:inherit;font-size:14px;
   font-weight:700;color:var(--slate);cursor:text;width:84px;text-align:right}
