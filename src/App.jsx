@@ -668,6 +668,30 @@ function DaysTrend({ trends, compact }) {
   );
 }
 
+/* The headline is a sum across every stage, which is not obvious from the
+   number alone. This shows the working so it never has to be taken on trust. */
+function CoverWorking({ data, repIds }) {
+  const stages = data.config.stages;
+  const agg = aggregate(data.current, repIds, stages);
+  const rows = stages.map((st, i) => ({
+    name: st.name,
+    gpv: agg.byStage[st.id].gpv,
+    odds: activationOdds(i),
+    value: agg.byStage[st.id].gpv * activationOdds(i)
+  }));
+  const total = rows.reduce((a, r) => a + r.value, 0);
+  return (
+    <div className="calc">
+      {rows.map((r) => (
+        <span key={r.name} className="calc-part">
+          <b>{r.name.split(" ")[0]}</b> {fmtMoney(r.gpv)} &times; {(r.odds * 100).toFixed(0)}% = {fmtMoney(r.value)}
+        </span>
+      ))}
+      <span className="calc-total">total {fmtMoney(total)}</span>
+    </div>
+  );
+}
+
 function Spark({ points }) {
   const v = (points || []).filter((p) => isFinite(p));
   if (v.length < 2) return null;
@@ -792,8 +816,10 @@ function MasterView({ ctx }) {
               <b>{fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month</b> for {cover.months.toFixed(1)} months.
               A full book lasts <b>{tgt.months.toFixed(1)}</b>.
               <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
-                {fmtMoney(cover.total)} expected to activate, against {fmtMoney(tgtOne.total * ids.length)} for a full book
+                {fmtMoney(cover.total)} expected to activate across all five stages, against{" "}
+                {fmtMoney(tgtOne.total * ids.length)} for a full book
               </div>
+              <CoverWorking data={data} repIds={ids} />
             </div>
           </div>
           <div className="minis">
@@ -1093,8 +1119,10 @@ function RepView({ ctx, rep }) {
               Their book would keep {fmtMoney(ACTIVATION_PER_MONTH)} a month running for{" "}
               {cover.months.toFixed(1)} months with nothing new added. A full book lasts <b>{tgt.months.toFixed(1)}</b>.
               <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
-                {fmtMoney(mine.total)} of pipeline &middot; {fmtMoney(cover.total)} of it expected to activate
+                {fmtMoney(mine.total)} of pipeline across all five stages, of which{" "}
+                {fmtMoney(cover.total)} is expected to activate eventually
               </div>
+              <CoverWorking data={data} repIds={[rep.id]} />
             </div>
           </div>
           <div className="minis">
@@ -2107,6 +2135,10 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
+.calc{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;max-width:640px}
+.calc-part{font-size:11.5px;font-weight:600;color:var(--slate);background:var(--paper);padding:3px 9px;border-radius:999px;white-space:nowrap}
+.calc-part b{font-weight:800;color:var(--ink-2)}
+.calc-total{font-size:11.5px;font-weight:800;color:var(--ink);background:var(--accent-bg);padding:3px 10px;border-radius:999px;white-space:nowrap}
 .st-risk{font-size:13px;color:var(--warn);background:var(--warn-bg);padding:9px 13px;border-radius:var(--r-sm);margin:0 0 16px;max-width:660px;font-weight:500}
 .st-risk b{font-weight:800}
 .st-risk-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--warn);margin-left:7px;vertical-align:middle}
