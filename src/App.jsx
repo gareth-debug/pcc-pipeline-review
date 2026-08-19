@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 7;
+const DATA_VERSION = 8;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -387,25 +387,31 @@ function stageFlow(d, repId, idx) {
   const outShort = Math.max(0, outNeed - pledgedOut);
   const holdOk = cell.gpv >= target;
 
-  /* One state per stage, in priority order, so a rep is never shown two
-     competing problems at once:
-       empty  nothing here to work with
-       move   there is stock, but not enough of it is committed onward
-       light  everything nameable is committed, the stage itself is thin
-       ok     holding enough and moving enough */
+  /* Two separate readings, because they answer different questions.
+
+     ACTION is what to do this week, and it is only ever about movement:
+       empty  nothing here to move
+       move   there is stock but not enough is committed onward
+       ok     enough is committed
+
+     RISK is forward-looking and about shape. A stage well under its target is
+     not a failure this week, it is a hole that lands once the deals that should
+     have crossed it would have reached activation. Being light in one stage
+     while heavy in another is a legitimate shape and is never marked down. */
   const lightBy = Math.max(0, target - cell.gpv);
   let state;
   if (cell.gpv <= 0) state = "empty";
   else if (outShort > 0) state = "move";
-  else if (lightBy > 0) state = "light";
   else state = "ok";
+
+  const hole = target > 0 && cell.gpv < target * 0.6;
 
   return {
     stage: st, prev, next, idx,
     gpv: cell.gpv, avgDays: cell.avgDays, target,
     inbound, outbound, pledgedIn, pledgedOut,
     gap, required, shortfall,
-    outNeed, outShort, holdOk, lightBy,
+    outNeed, outShort, holdOk, lightBy, hole,
     monthsOfStock: outNeed > 0 ? cell.gpv / (outNeed * WEEKS_PER_MONTH) : 0,
     isShort: state === "light" || state === "empty",
     isStuck: state === "move",
@@ -413,6 +419,77 @@ function stageFlow(d, repId, idx) {
   };
 }
 function sourceLabel(f) { return f.prev ? f.prev.name : "new pipeline"; }
+
+/* ------------------------------------------------------- weighted cover */
+
+/* Odds that a deal sitting in this stage eventually activates: the product of
+   every conversion rate from here to the end. A dollar in Mutual close plan is
+   worth about ten in Discovery, which is why a bottom-heavy book should not be
+   marked down for its shape. */
+function activationOdds(idx) {
+  return STAGE_MODEL.slice(idx).reduce((a, s) => a * s.conv, 1);
+}
+
+/* Expected activation sitting in the book, split into what is already signed
+   and what still has to be sold. Blending the two lets a fat implementation
+   queue hide a dead selling motion, so they are always reported separately. */
+function coverOf(d, repIds) {
+  const stages = d.config.stages;
+  const agg = aggregate(d.current, repIds, stages);
+  let selling = 0, locked = 0;
+  stages.forEach((st, i) => {
+    const v = agg.byStage[st.id].gpv * activationOdds(i);
+    if (i === stages.length - 1) locked += v; else selling += v;
+  });
+  const perMonth = ACTIVATION_PER_MONTH * (repIds.length || 1);
+  return {
+    selling, locked, total: selling + locked,
+    monthsSelling: perMonth > 0 ? selling / perMonth : 0,
+    monthsLocked: perMonth > 0 ? locked / perMonth : 0,
+    months: perMonth > 0 ? (selling + locked) / perMonth : 0
+  };
+}
+
+/* The same calculation on the target book, so there is something to compare to. */
+function targetCover() {
+  let selling = 0, locked = 0;
+  STAGE_MODEL.forEach((st, i) => {
+    const v = st.floor * activationOdds(i);
+    if (i === STAGE_MODEL.length - 1) locked += v; else selling += v;
+  });
+  return {
+    selling, locked, total: selling + locked,
+    monthsSelling: selling / ACTIVATION_PER_MONTH,
+    monthsLocked: locked / ACTIVATION_PER_MONTH,
+    months: (selling + locked) / ACTIVATION_PER_MONTH
+  };
+}
+
+/* How much has to move this week across the whole funnel, and how much of it
+   has actually been named. In a stagnant funnel this is the number that matters. */
+function flowOf(d, repIds, monday) {
+  const stages = d.config.stages;
+  let need = 0, named = 0;
+  stages.forEach((st, i) => {
+    need += weeklyOutflowNeed(i) * (repIds.length || 1);
+    named += d.commits
+      .filter((c) => c.status === "open" && c.fromStage === st.id && repIds.indexOf(c.repId) >= 0)
+      .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
+  });
+  return { need, named, pct: need > 0 ? (named / need) * 100 : 0 };
+}
+
+/* A hole in a stage does not hurt today. It hurts once the deals that should
+   have passed through it would have reached activation. */
+function impactHorizon(idx) {
+  const days = STAGE_MODEL.slice(idx).reduce((a, s) => a + s.dwellDays, 0);
+  const when = new Date(Date.now() + days * 864e5);
+  return {
+    days,
+    months: days / 30.4,
+    label: MONTHS[when.getMonth()] + " " + when.getFullYear()
+  };
+}
 
 /* --------------------------------------------------------- days trends */
 
@@ -634,11 +711,13 @@ function buildFocus(d, monday) {
           text: <>needs <em>{fmtMoney(f.outShort)}</em> more named out of <b>{st.name}</b>
             {" "}into {f.next ? f.next.name : "live"} this week</>
         });
-      } else if (f.state === "light" || f.state === "empty") {
+      }
+      if (f.hole) {
+        const h = impactHorizon(i);
         light.push({
           k: "warn", sort: f.lightBy, rep: r,
-          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b>
-            {i > 0 ? <> &mdash; fills from {d.config.stages[i - 1].name}</> : <> &mdash; needs new pipeline</>}</>
+          text: <>has a thin <b>{st.name}</b> at {fmtMoney(f.gpv)} of {fmtMoney(f.target)} &mdash;
+            lands in activation around <em>{h.label}</em></>
         });
       }
     });
@@ -677,12 +756,18 @@ function MasterView({ ctx }) {
   const { data, stages, ids, monday, baseline, actions, onEditing, setTab } = ctx;
   const cur = aggregate(data.current, ids, stages);
   const base = baseline ? aggregate(baseline.reps, ids, stages) : null;
-  const perRepTarget = Number(data.config.coverageTarget) || 0;
-  const target = perRepTarget * ids.length;
-  const gap = cur.coverage - target;
-  const pct = target > 0 ? (cur.coverage / target) * 100 : 0;
-  const covTone = tone(cur.coverage, target);
   const team = commitStats(data.commits, null, monday);
+  const cover = coverOf(data, ids);
+  const tgtOne = targetCover();
+  const tgt = { months: tgtOne.months, monthsLocked: tgtOne.monthsLocked, monthsSelling: tgtOne.monthsSelling };
+  const coverPct = tgt.months > 0 ? (cover.months / tgt.months) * 100 : 0;
+  const coverTone = tone(cover.months, tgt.months);
+  const flow = flowOf(data, ids, monday);
+  const flowTone = tone(flow.named, flow.need);
+  const discNeed = weeklyOutflowNeed(0) * ids.length;
+  const discNamed = data.commits
+    .filter((c) => c.status === "open" && c.fromStage === stages[0].id && ids.indexOf(c.repId) >= 0)
+    .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -692,35 +777,74 @@ function MasterView({ ctx }) {
 
   const scale = Math.max.apply(null, stages.map((st) => Math.max(cur.byStage[st.id].gpv, teamFloor(data, st))).concat([1]));
   const focus = buildFocus(data, monday);
-  const maxTotal = Math.max.apply(null, activeRepsOf(data).map((r) => aggregate(data.current, [r.id], stages).total).concat([1]));
+  const maxMonths = Math.max.apply(null, activeRepsOf(data).map((r) => coverOf(data, [r.id]).months).concat([tgtOne.months]));
 
   return (
     <>
       <div className="headline">
         <div className="headline-row">
-          <Gauge pct={Math.min(pct, 999)} tone={covTone} />
+          <Gauge pct={Math.min(coverPct, 999)} tone={coverTone} />
           <div>
-            <div className="hero-k">Pipeline coverage</div>
-            <div className="hero-v">{fmtMoney(cur.coverage)}</div>
+            <div className="hero-k">Activation cover</div>
+            <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "22px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
-              {gap >= 0
-                ? <><span className="over">{fmtMoney(gap)} above</span> the {fmtMoney(target)} target</>
-                : <><span className="short">{fmtMoney(Math.abs(gap))} behind</span> the {fmtMoney(target)} target</>}
+              of the {tgt.months.toFixed(1)} months the book should hold
               <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
-                {fmtMoney(perRepTarget)} each across {ids.length} reps
+                {fmtMoney(cover.total)} of expected activation across {ids.length} reps
               </div>
             </div>
           </div>
           <div className="minis">
             <div className="mini">
+              <div className="mini-k">Signed, going live</div>
+              <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
+              <div className="mini-s">of {tgt.monthsLocked.toFixed(1)}m &middot; {fmtMoney(cover.locked)}</div>
+            </div>
+            <div className="mini">
+              <div className="mini-k">Still to sell</div>
+              <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
+              <div className="mini-s">of {tgt.monthsSelling.toFixed(1)}m &middot; {fmtMoney(cover.selling)}</div>
+            </div>
+            <div className="mini">
               <div className="mini-k">Since Monday</div>
               <div className="mini-v">{base ? fmtSignedMoney(cur.total - base.total) : "\u2014"}</div>
               <div className="mini-s">{baseline ? "vs " + shortDate(baseline.weekOf) : "no baseline"}</div>
             </div>
+          </div>
+        </div>
+        <div className="track">
+          <div className={"track-fill " + coverTone} style={{ width: Math.min(100, coverPct).toFixed(1) + "%" }} />
+          <div className="track-tick" style={{ left: "100%" }} />
+        </div>
+        <div className="track-labels">
+          <span>0</span>
+          <span>{tgt.months.toFixed(1)} months of activation covered</span>
+        </div>
+      </div>
+
+      <div className="headline" style={{ marginTop: "14px" }}>
+        <div className="headline-row">
+          <Gauge pct={Math.min(flow.pct, 999)} tone={flowTone} />
+          <div>
+            <div className="hero-k">Moving this week</div>
+            <div className="hero-v">{fmtMoney(flow.named)}</div>
+            <div className="hero-s">
+              of the <b>{fmtMoney(flow.need)}</b> that has to cross a stage boundary this week
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
+                a book only stays the right size if this number gets hit
+              </div>
+            </div>
+          </div>
+          <div className="minis">
             <div className="mini">
-              <div className="mini-k">Committed</div>
-              <div className="mini-v">{fmtMoney(team.thisWeekGpv)}</div>
-              <div className="mini-s">{team.thisWeek.length} deals this week</div>
+              <div className="mini-k">Out of Discovery</div>
+              <div className="mini-v">{fmtMoney(discNamed)}</div>
+              <div className="mini-s">of {fmtMoney(discNeed)} needed</div>
+            </div>
+            <div className="mini">
+              <div className="mini-k">Open commits</div>
+              <div className="mini-v">{team.open.length}</div>
+              <div className="mini-s">{fmtMoney(team.openGpv)} in play</div>
             </div>
             <div className="mini">
               <div className="mini-k">Team hit rate</div>
@@ -729,11 +853,6 @@ function MasterView({ ctx }) {
             </div>
           </div>
         </div>
-        <div className="track">
-          <div className={"track-fill " + covTone} style={{ width: Math.min(100, pct).toFixed(1) + "%" }} />
-          <div className="track-tick" style={{ left: "100%" }} />
-        </div>
-        <div className="track-labels"><span>0</span><span>{fmtMoney(target)} target</span></div>
       </div>
 
       <div className="section">
@@ -782,11 +901,14 @@ function MasterView({ ctx }) {
                 <div style={{ fontSize: "12px", marginTop: "2px", fontWeight: 600 }}>{b ? <Delta value={a.gpv - b.gpv} /> : null}</div>
               </div>
               <div className="fun-gap">
-                {outNeedTeam > 0
-                  ? <Pill tone={movedTeam >= outNeedTeam ? "good" : (movedTeam > 0 ? "warn" : "bad")}>
-                      {fmtMoney(movedTeam)} of {fmtMoney(outNeedTeam)}
-                    </Pill>
-                  : <Pill tone="flat">{"\u2014"}</Pill>}
+                <Pill tone={movedTeam >= outNeedTeam ? "good" : (movedTeam > 0 ? "warn" : "bad")}>
+                  {fmtMoney(movedTeam)} of {fmtMoney(outNeedTeam)}
+                </Pill>
+                {a.gpv < floor * 0.6 ? (
+                  <div className="faint" style={{ fontSize: "11px", fontWeight: 600, marginTop: "4px" }}>
+                    thin &middot; bites {impactHorizon(i).label}
+                  </div>
+                ) : null}
               </div>
               <div className="fun-days">
                 {fmtDays(a.avgDays)}
@@ -808,7 +930,7 @@ function MasterView({ ctx }) {
 
       <div className="section">
         <div className="section-h">
-          <h2>The team</h2><span className="hint">click a name to open their funnel</span>
+          <h2>The team</h2><span className="hint">cover is months of activation in the book; shape is not scored</span>
           <span className="spacer" />
           <button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>
         </div>
@@ -816,43 +938,44 @@ function MasterView({ ctx }) {
           <thead>
             <tr>
               <th>Rep</th>
-              <th className="r nar">Pipeline</th>
-              <th className="r nar">vs target</th>
-              <th className="r nar">Stages short</th>
-              <th className="r nar">To close</th>
+              <th className="r nar">Cover</th>
+              <th className="r nar">Signed</th>
+              <th className="r nar">To sell</th>
+              <th className="r nar">Moving this week</th>
+              <th className="r nar">Thin stages</th>
               <th className="r nar">Hit rate</th>
             </tr>
           </thead>
           <tbody>
             {activeRepsOf(data).map((r) => {
-              const m = aggregate(data.current, [r.id], stages);
-              const s = commitStats(data.commits, r.id, monday);
-              let tot = 0, shortStages = 0, toClose = 0;
-              stages.forEach((st, i) => {
-                tot += repTarget(data, r.id, st.id);
-                const f = stageFlow(data, r.id, i);
-                if (f.isShort) { shortStages += 1; if (takesInbound(i)) toClose += f.shortfall; }
-              });
-              const rtn = tone(m.total, tot);
-              const barMax = Math.max(maxTotal, tot);
+              const s2 = commitStats(data.commits, r.id, monday);
+              const cv = coverOf(data, [r.id]);
+              const fl = flowOf(data, [r.id], monday);
+              let thin = 0;
+              stages.forEach((st, i) => { if (stageFlow(data, r.id, i).hole) thin += 1; });
+              const ctone = tone(cv.months, tgt.months);
+              const barMax = Math.max(maxMonths, tgt.months);
               return (
                 <tr key={r.id}>
                   <td>
                     <div className="namecell">
                       <button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button>
                       <span className="repbar">
-                        <span className={rtn} style={{ width: ((m.total / barMax) * 100).toFixed(1) + "%" }} />
-                        <i style={{ left: ((tot / barMax) * 100).toFixed(1) + "%" }} />
+                        <span className={ctone} style={{ width: ((cv.months / barMax) * 100).toFixed(1) + "%" }} />
+                        <i style={{ left: ((tgt.months / barMax) * 100).toFixed(1) + "%" }} />
                       </span>
                     </div>
                   </td>
-                  <td className="r nar strong">{fmtMoney(m.total)}</td>
-                  <td className="r nar"><Delta value={m.total - tot} /></td>
+                  <td className="r nar strong">{cv.months.toFixed(1)}m</td>
+                  <td className="r nar muted">{cv.monthsLocked.toFixed(1)}m</td>
+                  <td className="r nar muted">{cv.monthsSelling.toFixed(1)}m</td>
                   <td className="r nar">
-                    {shortStages ? <Pill tone={shortStages > 2 ? "bad" : "warn"}>{shortStages} of {stages.length}</Pill> : <Pill tone="good">none</Pill>}
+                    <Pill tone={fl.named >= fl.need ? "good" : (fl.named > 0 ? "warn" : "bad")}>
+                      {fmtMoney(fl.named)} of {fmtMoney(fl.need)}
+                    </Pill>
                   </td>
-                  <td className={"r nar" + (toClose > 0 ? " strong" : " faint")}>{toClose > 0 ? fmtMoney(toClose) : "\u2014"}</td>
-                  <td className="r nar">{s.hitRate === null ? <span className="faint">{"\u2014"}</span> : Math.round(s.hitRate * 100) + "%"}</td>
+                  <td className="r nar">{thin ? <Pill tone="warn">{thin}</Pill> : <Pill tone="good">none</Pill>}</td>
+                  <td className="r nar">{s2.hitRate === null ? <span className="faint">{"\u2014"}</span> : Math.round(s2.hitRate * 100) + "%"}</td>
                 </tr>
               );
             })}
@@ -938,12 +1061,9 @@ function RepView({ ctx, rep }) {
   const mb = baseline ? aggregate(baseline.reps, [rep.id], stages) : null;
   const st = commitStats(data.commits, rep.id, monday);
 
-  let totTarget = 0, toClose = 0, shortStages = 0;
-  stages.forEach((s, i) => {
-    totTarget += repTarget(data, rep.id, s.id);
-    const f = stageFlow(data, rep.id, i);
-    if (f.isShort) { shortStages += 1; if (takesInbound(i)) toClose += f.shortfall; }
-  });
+  const cover = coverOf(data, [rep.id]);
+  const tgt = targetCover();
+  const flow = flowOf(data, [rep.id], monday);
 
   /* Open on the first stage that needs work, until the user picks another. */
   let firstShort = stages.length ? stages[0].id : null;
@@ -966,30 +1086,29 @@ function RepView({ ctx, rep }) {
         <div className="headline-row">
           <div>
             <div className="hero-k">{rep.name}</div>
-            <div className="hero-v">{fmtMoney(mine.total)}</div>
+            <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "20px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
-              {mine.total >= totTarget
-                ? <span className="over">{fmtMoney(mine.total - totTarget)} above</span>
-                : <span className="short">{fmtMoney(totTarget - mine.total)} below</span>}
-              {" their " + fmtMoney(totTarget) + " target"}
-              {mb ? " \u00b7 " + fmtSignedMoney(mine.total - mb.total) + " since Monday" : ""}
+              of activation covered, against {tgt.months.toFixed(1)}
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
+                {fmtMoney(mine.total)} of pipeline &middot; {fmtMoney(cover.total)} expected to activate
+              </div>
             </div>
           </div>
           <div className="minis">
             <div className="mini">
-              <div className="mini-k">To close this week</div>
-              <div className="mini-v">{toClose > 0 ? fmtMoney(toClose) : "\u2014"}</div>
-              <div className="mini-s">{shortStages ? shortStages + " stage" + (shortStages === 1 ? "" : "s") + " short" : "all stages covered"}</div>
+              <div className="mini-k">Signed, going live</div>
+              <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
+              <div className="mini-s">of {tgt.monthsLocked.toFixed(1)}m</div>
             </div>
             <div className="mini">
-              <div className="mini-k">Committed</div>
-              <div className="mini-v">{fmtMoney(st.openGpv)}</div>
-              <div className="mini-s">{st.open.length} open</div>
+              <div className="mini-k">Still to sell</div>
+              <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
+              <div className="mini-s">of {tgt.monthsSelling.toFixed(1)}m</div>
             </div>
             <div className="mini">
-              <div className="mini-k">Hit rate</div>
-              <div className="mini-v">{st.hitRate === null ? "\u2014" : Math.round(st.hitRate * 100) + "%"}</div>
-              <div className="mini-s">{st.moved} moved, {st.missed} missed</div>
+              <div className="mini-k">Moving this week</div>
+              <div className="mini-v">{fmtMoney(flow.named)}</div>
+              <div className="mini-s">of {fmtMoney(flow.need)} needed</div>
             </div>
           </div>
         </div>
@@ -1011,10 +1130,9 @@ function RepView({ ctx, rep }) {
 
             const nextName = f.next ? f.next.name : "live";
             const stateEl =
-              f.state === "empty" ? <Pill tone="bad">nothing here</Pill>
+              f.state === "empty" ? <Pill tone="bad">nothing to move</Pill>
                 : f.state === "move" ? <Pill tone="warn">move {fmtMoney(f.outShort)}</Pill>
-                  : f.state === "light" ? <Pill tone="bad">{fmtMoney(f.lightBy)} light</Pill>
-                    : <Pill tone="good">on track</Pill>;
+                  : <Pill tone="good">on track</Pill>;
 
             /* One short sentence. The reasoning lives in Settings, not here. */
             let lead;
@@ -1026,12 +1144,6 @@ function RepView({ ctx, rep }) {
               lead = <><em>{fmtMoney(f.outNeed)}</em> should move to {nextName} this week.
                 {" "}{f.pledgedOut > 0 ? "You have named " + fmtMoney(f.pledgedOut) + "." : "Nothing is named yet."}
                 {" "}Add <em>{fmtMoney(f.outShort)}</em> more.</>;
-            } else if (f.state === "light") {
-              lead = inb
-                ? <>Everything nameable is committed, but the stage is <em>{fmtMoney(f.lightBy)}</em> under
-                  the {fmtMoney(f.target)} it should hold. That gets filled from {sourceLabel(f)}.</>
-                : <>Holding <em>{fmtMoney(f.gpv)}</em>, which is {fmtMoney(f.lightBy)} under
-                  the {fmtMoney(f.target)} it should hold. Needs new pipeline.</>;
             } else {
               lead = <>Holding <em>{fmtMoney(f.gpv)}</em> and moving <em>{fmtMoney(f.pledgedOut)}</em> to {nextName} this week. On track.</>;
             }
@@ -1058,12 +1170,22 @@ function RepView({ ctx, rep }) {
                       })()}
                     </span>
                   </span>
-                  <span className="st-state">{stateEl}</span>
+                  <span className="st-state">
+                    {stateEl}
+                    {f.hole ? <span className="st-risk-dot" title={"Thin: shows up in activation around " + impactHorizon(i).label} /> : null}
+                  </span>
                 </button>
 
                 {isOpen ? (
                   <div className="st-body">
                     <p className={"st-lead " + f.state}>{lead}</p>
+                    {f.hole ? (
+                      <p className="st-risk">
+                        Holding {fmtMoney(f.gpv)} against {fmtMoney(f.target)}. Not this week&rsquo;s problem &mdash;
+                        a thin {s.name} shows up in activation around <b>{impactHorizon(i).label}</b>
+                        {inb ? ", and gets filled from " + sourceLabel(f) : ", and needs new pipeline"}.
+                      </p>
+                    ) : null}
                     <div className="st-fields">
                       <span className="st-f">
                         <label>GPV</label>
@@ -1229,6 +1351,43 @@ function SettingsView({ ctx }) {
           Implementation is pinned at three months&rsquo; cover, since a signed deal still takes about{" "}
           {STAGE_MODEL[4].dwellDays} days to go live. The four earlier stages are scaled so the total
           lands on {fmtMoney(PER_REP_TARGET)}.
+        </p>
+        <table className="tbl" style={{ marginTop: "18px" }}>
+          <thead>
+            <tr>
+              <th>A dollar sitting in</th>
+              <th className="r nar">Odds it activates</th>
+              <th className="r nar">Worth</th>
+              <th className="r nar">Target there</th>
+              <th className="r nar">Expected activation</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stages.map((st, i) => (
+              <tr key={st.id}>
+                <td><span className="idx">{i + 1}</span> {st.name}</td>
+                <td className="r nar muted">{(activationOdds(i) * 100).toFixed(1)}%</td>
+                <td className="r nar muted">{(activationOdds(i) / activationOdds(0)).toFixed(1)}x Discovery</td>
+                <td className="r nar muted">{fmtMoney(st.floor)}</td>
+                <td className="r nar strong">{fmtMoney(st.floor * activationOdds(i))}</td>
+              </tr>
+            ))}
+            <tr>
+              <td className="strong">Whole book</td>
+              <td className="r nar" />
+              <td className="r nar" />
+              <td className="r nar strong">{fmtMoney(PER_REP_TARGET)}</td>
+              <td className="r nar strong">{fmtMoney(targetCover().total)} &middot; {targetCover().months.toFixed(1)} months</td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="muted" style={{ marginTop: "14px", maxWidth: "740px", fontSize: "13.5px" }}>
+          <b>Shape is not scored.</b> A dollar in Mutual close plan is worth roughly ten in Discovery, so a
+          rep who is heavy late and light in the middle is ahead, not behind, and the headline reflects
+          that. What a thin stage does earn is a dated note: deals that should be crossing it now are the
+          ones that activate months from now, so the app says when the gap lands rather than marking the
+          week down. Signed business and unsold pipeline are reported separately, because a full
+          implementation queue can otherwise hide a selling motion that has stopped.
         </p>
         <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>The holding figure is the easier half.</b> A stage that is full but never empties is a
@@ -1941,6 +2100,9 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
+.st-risk{font-size:13px;color:var(--warn);background:var(--warn-bg);padding:9px 13px;border-radius:var(--r-sm);margin:0 0 16px;max-width:660px;font-weight:500}
+.st-risk b{font-weight:800}
+.st-risk-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--warn);margin-left:7px;vertical-align:middle}
 .trend{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center}
 .tchip{font-size:11.5px;font-weight:700;padding:2px 7px;border-radius:999px;background:var(--paper);color:var(--slate);white-space:nowrap}
 .tchip b{font-weight:800;opacity:.55;margin-right:1px}
