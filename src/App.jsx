@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 5;
+const DATA_VERSION = 6;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -387,14 +387,17 @@ function stageFlow(d, repId, idx) {
   const outShort = Math.max(0, outNeed - pledgedOut);
   const holdOk = cell.gpv >= target;
 
-  /* A stage that is full but not emptying is stuck, and stuck is the thing
-     worth talking about. Filling only takes priority when there is genuinely
-     too little in the stage to push anything out of it. */
+  /* One state per stage, in priority order, so a rep is never shown two
+     competing problems at once:
+       empty  nothing here to work with
+       move   there is stock, but not enough of it is committed onward
+       light  everything nameable is committed, the stage itself is thin
+       ok     holding enough and moving enough */
+  const lightBy = Math.max(0, target - cell.gpv);
   let state;
-  if (inb && !holdOk && shortfall > 0) state = "short";
-  else if (outShort > 0 && cell.gpv > 0) state = "stuck";
-  else if (!holdOk) state = "short";
-  else if (required > 0 && shortfall <= 0) state = "covered";
+  if (cell.gpv <= 0) state = "empty";
+  else if (outShort > 0) state = "move";
+  else if (lightBy > 0) state = "light";
   else state = "ok";
 
   return {
@@ -402,10 +405,10 @@ function stageFlow(d, repId, idx) {
     gpv: cell.gpv, avgDays: cell.avgDays, target,
     inbound, outbound, pledgedIn, pledgedOut,
     gap, required, shortfall,
-    outNeed, outShort, holdOk,
+    outNeed, outShort, holdOk, lightBy,
     monthsOfStock: outNeed > 0 ? cell.gpv / (outNeed * WEEKS_PER_MONTH) : 0,
-    isShort: inb ? shortfall > 0 : gap > 0,
-    isStuck: state === "stuck",
+    isShort: state === "light" || state === "empty",
+    isStuck: state === "move",
     state
   };
 }
@@ -568,57 +571,38 @@ function Bar({ value, target, scale, tone: t, pledged }) {
 /* ---------------------------------------------------------- master view */
 
 function buildFocus(d, monday) {
-  const asks = [], gaps = [], extras = [];
+  const moves = [], light = [], extras = [];
   activeRepsOf(d).forEach((r) => {
     d.config.stages.forEach((st, i) => {
       const f = stageFlow(d, r.id, i);
-      if (!f.isShort) return;
-      if (!takesInbound(i)) {
-        gaps.push({
-          k: "warn", sort: f.gap, rep: r,
-          text: <>is <em>{fmtMoney(f.gap)}</em> light in <b>{st.name}</b>
-            {f.pledgedOut > 0 ? ", with " + fmtMoney(f.pledgedOut) + " leaving it this week" : ""}
-            {" \u2014 needs new pipeline, not a commit"}</>
+      if (f.state === "move") {
+        moves.push({
+          k: "bad", sort: f.outShort, rep: r,
+          text: <>needs <em>{fmtMoney(f.outShort)}</em> more named out of <b>{st.name}</b>
+            {" "}into {f.next ? f.next.name : "live"} this week</>
         });
-        return;
+      } else if (f.state === "light" || f.state === "empty") {
+        light.push({
+          k: "warn", sort: f.lightBy, rep: r,
+          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b>
+            {i > 0 ? <> &mdash; fills from {d.config.stages[i - 1].name}</> : <> &mdash; needs new pipeline</>}</>
+        });
       }
-      if (f.state === "stuck") return;   /* handled by the movement pass below */
-      asks.push({
-        k: "bad", sort: f.shortfall, rep: r,
-        text: <>needs <em>{fmtMoney(f.shortfall)}</em> into <b>{st.name}</b>
-          {f.pledgedIn > 0 ? " on top of the " + fmtMoney(f.pledgedIn) + " pledged" : " and has nothing pledged"}
-          {" \u2014 lock a commit from " + sourceLabel(f)}</>
-      });
     });
   });
-  /* Movement first: a full stage that will not empty is the thing to fix. */
-  const stucks = [];
-  activeRepsOf(d).forEach((r) => {
-    d.config.stages.forEach((st, i) => {
-      const f = stageFlow(d, r.id, i);
-      if (!f.isStuck) return;
-      stucks.push({
-        k: "bad", sort: f.outShort, rep: r,
-        text: <>is sitting on <em>{fmtMoney(f.gpv)}</em> in <b>{st.name}</b> with only{" "}
-          {fmtMoney(f.pledgedOut)} committed out &mdash; name <em>{fmtMoney(f.outShort)}</em> more
-          into {f.next ? f.next.name : "live"} this week</>
-      });
-    });
-  });
-  stucks.sort((a, b) => b.sort - a.sort);
-  asks.sort((a, b) => b.sort - a.sort);
-  gaps.sort((a, b) => b.sort - a.sort);
+  moves.sort((a, b) => b.sort - a.sort);
+  light.sort((a, b) => b.sort - a.sort);
 
   d.commits.filter((c) => c.status === "open" && weeksBetween(c.weekOf, monday) >= 2).forEach((c) => {
     const rep = d.config.reps.filter((r) => r.id === c.repId)[0];
     extras.push({
       k: "warn", rep,
-      text: <><b>{c.name || "An unnamed deal"}</b> has sat for <em>{weeksBetween(c.weekOf, monday)} weeks</em> without moving</>
+      text: <><b>{c.name || "An unnamed deal"}</b> has not moved in <em>{weeksBetween(c.weekOf, monday)} weeks</em></>
     });
   });
   activeRepsOf(d).forEach((r) => {
     if (commitStats(d.commits, r.id, monday).thisWeek.length === 0) {
-      extras.push({ k: "warn", rep: r, text: <>has committed to nothing this week</> });
+      extras.push({ k: "warn", rep: r, text: <>has named nothing to move this week</> });
     }
     d.config.stages.forEach((st) => {
       const c = cellOf(d.current, r.id, st.id);
@@ -630,7 +614,7 @@ function buildFocus(d, monday) {
       }
     });
   });
-  return stucks.slice(0, 4).concat(asks.slice(0, 3)).concat(gaps.slice(0, 2)).concat(extras.slice(0, 2));
+  return moves.slice(0, 5).concat(light.slice(0, 2)).concat(extras.slice(0, 2));
 }
 
 function MasterView({ ctx }) {
@@ -864,36 +848,26 @@ function MasterView({ ctx }) {
 
 /* ------------------------------------------------------------- rep view */
 
-function CommitRow({ commit, stages, editable, actions, onEditing, monday }) {
+/* One deal the rep has named to move out of the stage they are looking at.
+   The only choices are what it is called, where it is going, and how big. */
+function CommitRow({ commit, stages, actions, onEditing, monday }) {
   const age = weeksBetween(commit.weekOf, monday);
   return (
     <div className="cmt">
-      {editable ? (
+      <span>
         <TextInput value={commit.name} placeholder="Opportunity name" onEditing={onEditing}
           onCommit={(v) => actions.setCommit(commit.id, "name", v)} />
-      ) : (
-        <span>
-          {commit.name || <span className="faint">unnamed</span>}
-          {age > 0 ? <span className="tag carried">{age}w</span> : null}
-        </span>
-      )}
-      {editable ? (
-        <span className="cmt-src">
-          <StageSelect value={commit.fromStage} stages={stages} onEditing={onEditing}
-            onChange={(v) => actions.setCommit(commit.id, "fromStage", v)} />
-        </span>
-      ) : (
-        <span className="cmt-src">to {stages.filter((s) => s.id === commit.toStage).map((s) => s.name)[0] || "\u2014"}</span>
-      )}
-      {editable ? (
-        <MoneyInput value={commit.gpv} onEditing={onEditing} onCommit={(v) => actions.setCommit(commit.id, "gpv", v)} />
-      ) : (
-        <span className="flow-amt">{fmtMoney(commit.gpv)}</span>
-      )}
+        {age > 0 ? <span className="tag carried">carried {age}w</span> : null}
+      </span>
+      <span className="cmt-src">
+        <StageSelect value={commit.toStage} stages={stages} onEditing={onEditing}
+          onChange={(v) => actions.setCommit(commit.id, "toStage", v)} />
+      </span>
+      <MoneyInput value={commit.gpv} onEditing={onEditing} onCommit={(v) => actions.setCommit(commit.id, "gpv", v)} />
       <span className="acts">
         <button className="btn ok" onClick={() => actions.resolveCommit(commit.id, "moved")}>Moved</button>
         <button className="btn no" onClick={() => actions.resolveCommit(commit.id, "missed")}>Missed</button>
-        {editable ? <button className="btn x" title="Delete" onClick={() => actions.deleteCommit(commit.id)}>×</button> : null}
+        <button className="btn x" title="Delete" onClick={() => actions.deleteCommit(commit.id)}>×</button>
       </span>
     </div>
   );
@@ -977,36 +951,33 @@ function RepView({ ctx, rep }) {
             const hasBase = !!b && (b.gpv > 0 || b.avgDays > 0);
             const isOpen = s.id === activeStage;
             const t = tone(f.gpv, f.target);
-            const edge = f.state === "short" ? "bad" : (f.state === "stuck" ? "warn" : "good");
-
-            const stateEl =
-              f.state === "stuck" ? <Pill tone="warn">move {fmtMoney(f.outShort)}</Pill>
-                : f.state === "short" ? (inb
-                  ? <Pill tone="bad">need {fmtMoney(f.shortfall)}</Pill>
-                  : <Pill tone="bad">{fmtMoney(f.gap)} light</Pill>)
-                  : f.state === "covered" ? <Pill tone="good">covered</Pill>
-                    : <Pill tone="good">flowing</Pill>;
+            const edge = f.state === "move" ? "warn" : (f.state === "ok" ? "good" : "bad");
 
             const nextName = f.next ? f.next.name : "live";
+            const stateEl =
+              f.state === "empty" ? <Pill tone="bad">nothing here</Pill>
+                : f.state === "move" ? <Pill tone="warn">move {fmtMoney(f.outShort)}</Pill>
+                  : f.state === "light" ? <Pill tone="bad">{fmtMoney(f.lightBy)} light</Pill>
+                    : <Pill tone="good">on track</Pill>;
+
+            /* One short sentence. The reasoning lives in Settings, not here. */
             let lead;
-            if (f.state === "stuck") {
-              lead = <>
-                Holding <em>{fmtMoney(f.gpv)}</em>{f.holdOk ? ", which is over the " + fmtMoney(f.target) + " target" : ""} &mdash;
-                the constraint here is movement, not volume. <em>{fmtMoney(f.outNeed)}</em> needs to cross into {nextName} this
-                week and {f.pledgedOut > 0 ? "only " + fmtMoney(f.pledgedOut) + " is committed" : "nothing is committed"}.
-                Name <em>{fmtMoney(f.outShort)}</em> more.
-                {f.monthsOfStock >= 4 ? " At this rate that is " + f.monthsOfStock.toFixed(1) + " months of stock sitting still." : ""}
-              </>;
-            } else if (f.state === "short" && inb) {
-              lead = <>Needs <em>{fmtMoney(f.shortfall)}</em> more in from {sourceLabel(f)}{f.pledgedOut > 0
-                ? " \u2014 " + fmtMoney(f.pledgedOut) + " is leaving for " + nextName + ", so holding " + fmtMoney(f.target) + " takes " + fmtMoney(f.required) + " of inflow"
-                : ""}.</>;
-            } else if (f.state === "short") {
-              lead = <><em>{fmtMoney(f.gap)}</em> below the {fmtMoney(f.target)} target and too thin to feed {nextName} &mdash; this one needs prospecting, not a commit.</>;
-            } else if (f.state === "covered") {
-              lead = <>Covered: <em>{fmtMoney(f.pledgedIn)}</em> pledged in against {fmtMoney(f.required)} needed, and {fmtMoney(f.pledgedOut)} moving out to {nextName}.</>;
+            if (f.state === "empty") {
+              lead = inb
+                ? <>Nothing in this stage yet. It fills when {sourceLabel(f)} deals move across.</>
+                : <>Nothing in this stage yet. This one fills from prospecting.</>;
+            } else if (f.state === "move") {
+              lead = <><em>{fmtMoney(f.outNeed)}</em> should move to {nextName} this week.
+                {" "}{f.pledgedOut > 0 ? "You have named " + fmtMoney(f.pledgedOut) + "." : "Nothing is named yet."}
+                {" "}Add <em>{fmtMoney(f.outShort)}</em> more.</>;
+            } else if (f.state === "light") {
+              lead = inb
+                ? <>Everything nameable is committed, but the stage is <em>{fmtMoney(f.lightBy)}</em> under
+                  the {fmtMoney(f.target)} it should hold. That gets filled from {sourceLabel(f)}.</>
+                : <>Holding <em>{fmtMoney(f.gpv)}</em>, which is {fmtMoney(f.lightBy)} under
+                  the {fmtMoney(f.target)} it should hold. Needs new pipeline.</>;
             } else {
-              lead = <>Holding <em>{fmtMoney(f.gpv)}</em> and pushing <em>{fmtMoney(f.pledgedOut)}</em> into {nextName} this week, against {fmtMoney(f.outNeed)} needed. On track.</>;
+              lead = <>Holding <em>{fmtMoney(f.gpv)}</em> and moving <em>{fmtMoney(f.pledgedOut)}</em> to {nextName} this week. On track.</>;
             }
 
             return (
@@ -1070,32 +1041,24 @@ function RepView({ ctx, rep }) {
                       </span>
                     </div>
 
-                    {inb ? (
-                      <>
-                        <div className="cmt-lbl">Coming in from {sourceLabel(f)}</div>
-                        {f.inbound.length ? f.inbound.map((c) => (
-                          <CommitRow key={c.id} commit={c} stages={stages} editable actions={actions} onEditing={onEditing} monday={monday} />
-                        )) : <div className="cmt-none">Nothing pledged in yet.</div>}
-                      </>
-                    ) : (
-                      <div className="cmt-none">Top of funnel &mdash; fills from prospecting, so nothing is committed in.</div>
-                    )}
+                    <div className="cmt-lbl">
+                      Moving out of {s.name} this week &mdash; {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} needed
+                    </div>
+                    {f.outbound.length ? f.outbound.map((c) => (
+                      <CommitRow key={c.id} commit={c} stages={stages} actions={actions} onEditing={onEditing} monday={monday} />
+                    )) : <div className="cmt-none">No deals named yet.</div>}
 
-                    {f.outbound.length ? (
-                      <>
-                        <div className="cmt-lbl">Going out</div>
-                        {f.outbound.map((c) => (
-                          <CommitRow key={c.id} commit={c} stages={stages} editable={false} actions={actions} onEditing={onEditing} monday={monday} />
-                        ))}
-                      </>
+                    {f.inbound.length ? (
+                      <div className="cmt-none" style={{ marginTop: "10px" }}>
+                        Arriving from {sourceLabel(f)} this week: {f.inbound.length} deal{f.inbound.length === 1 ? "" : "s"},{" "}
+                        {fmtMoney(f.pledgedIn)}. Marked off in {sourceLabel(f)}.
+                      </div>
                     ) : null}
 
                     <div className="row-acts">
-                      {inb ? (
-                        <button className="btn primary" onClick={() => actions.addCommitInto(rep.id, s.id)}>
-                          Commit a deal into {s.name}
-                        </button>
-                      ) : null}
+                      <button className="btn primary" onClick={() => actions.addCommitOutOf(rep.id, s.id)}>
+                        Move a deal out of {s.name}
+                      </button>
                       {i < stages.length - 1 ? (
                         <button className="btn txt" onClick={() => setOpenStage(stages[i + 1].id)}>
                           Next: {stages[i + 1].name} {"\u2192"}
@@ -1582,12 +1545,14 @@ export default function App() {
       });
       setTab("master");
     },
-    addCommitInto(repId, stageId) {
+    /* A rep works a stage by naming what leaves it, so the stage they are
+       looking at is the source and the next stage is the default destination. */
+    addCommitOutOf(repId, stageId) {
       update((d) => {
         const i = d.config.stages.findIndex((s) => s.id === stageId);
-        const from = i > 0 ? d.config.stages[i - 1].id : "";
+        const to = i >= 0 && i < d.config.stages.length - 1 ? d.config.stages[i + 1].id : "";
         d.commits.push({
-          id: uid("cmt"), repId, name: "", gpv: 0, fromStage: from, toStage: stageId,
+          id: uid("cmt"), repId, name: "", gpv: 0, fromStage: stageId, toStage: to,
           weekOf: thisMonday(), status: "open", resolvedWeek: null, createdAt: Date.now()
         });
       });
