@@ -785,25 +785,27 @@ function MasterView({ ctx }) {
         <div className="headline-row">
           <Gauge pct={Math.min(coverPct, 999)} tone={coverTone} />
           <div>
-            <div className="hero-k">Activation cover</div>
+            <div className="hero-k">How long the book lasts</div>
             <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "22px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
-              of the {tgt.months.toFixed(1)} months the book should hold
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
-                {fmtMoney(cover.total)} of expected activation across {ids.length} reps
+              If no new deal ever came in, what the team is already working would keep activation at{" "}
+              <b>{fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month</b> for {cover.months.toFixed(1)} months.
+              A full book lasts <b>{tgt.months.toFixed(1)}</b>.
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
+                {fmtMoney(cover.total)} expected to activate, against {fmtMoney(tgtOne.total * ids.length)} for a full book
               </div>
             </div>
           </div>
           <div className="minis">
             <div className="mini">
-              <div className="mini-k">Signed, going live</div>
+              <div className="mini-k">Already won</div>
               <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
-              <div className="mini-s">of {tgt.monthsLocked.toFixed(1)}m &middot; {fmtMoney(cover.locked)}</div>
+              <div className="mini-s">signed, waiting to go live &middot; target {tgt.monthsLocked.toFixed(1)}m</div>
             </div>
             <div className="mini">
-              <div className="mini-k">Still to sell</div>
+              <div className="mini-k">Still to win</div>
               <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
-              <div className="mini-s">of {tgt.monthsSelling.toFixed(1)}m &middot; {fmtMoney(cover.selling)}</div>
+              <div className="mini-s">still has to be sold &middot; target {tgt.monthsSelling.toFixed(1)}m</div>
             </div>
             <div className="mini">
               <div className="mini-k">Since Monday</div>
@@ -818,7 +820,7 @@ function MasterView({ ctx }) {
         </div>
         <div className="track-labels">
           <span>0</span>
-          <span>{tgt.months.toFixed(1)} months of activation covered</span>
+          <span>{tgt.months.toFixed(1)} months = a full book</span>
         </div>
       </div>
 
@@ -826,12 +828,12 @@ function MasterView({ ctx }) {
         <div className="headline-row">
           <Gauge pct={Math.min(flow.pct, 999)} tone={flowTone} />
           <div>
-            <div className="hero-k">Moving this week</div>
+            <div className="hero-k">Deals named to move this week</div>
             <div className="hero-v">{fmtMoney(flow.named)}</div>
             <div className="hero-s">
-              of the <b>{fmtMoney(flow.need)}</b> that has to cross a stage boundary this week
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
-                a book only stays the right size if this number gets hit
+              of the <b>{fmtMoney(flow.need)}</b> that should move up a stage this week
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
+                the book above only refills if this one gets hit
               </div>
             </div>
           </div>
@@ -930,7 +932,7 @@ function MasterView({ ctx }) {
 
       <div className="section">
         <div className="section-h">
-          <h2>The team</h2><span className="hint">cover is months of activation in the book; shape is not scored</span>
+          <h2>The team</h2><span className="hint">how many months each book would last with nothing new added &mdash; a full one lasts {tgt.months.toFixed(1)}</span>
           <span className="spacer" />
           <button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>
         </div>
@@ -938,10 +940,10 @@ function MasterView({ ctx }) {
           <thead>
             <tr>
               <th>Rep</th>
-              <th className="r nar">Cover</th>
-              <th className="r nar">Signed</th>
-              <th className="r nar">To sell</th>
-              <th className="r nar">Moving this week</th>
+              <th className="r nar">Book lasts</th>
+              <th className="r nar">Already won</th>
+              <th className="r nar">Still to win</th>
+              <th className="r nar">Named to move</th>
               <th className="r nar">Thin stages</th>
               <th className="r nar">Hit rate</th>
             </tr>
@@ -1088,27 +1090,28 @@ function RepView({ ctx, rep }) {
             <div className="hero-k">{rep.name}</div>
             <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "20px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
-              of activation covered, against {tgt.months.toFixed(1)}
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "3px", fontWeight: 600 }}>
-                {fmtMoney(mine.total)} of pipeline &middot; {fmtMoney(cover.total)} expected to activate
+              Their book would keep {fmtMoney(ACTIVATION_PER_MONTH)} a month running for{" "}
+              {cover.months.toFixed(1)} months with nothing new added. A full book lasts <b>{tgt.months.toFixed(1)}</b>.
+              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
+                {fmtMoney(mine.total)} of pipeline &middot; {fmtMoney(cover.total)} of it expected to activate
               </div>
             </div>
           </div>
           <div className="minis">
             <div className="mini">
-              <div className="mini-k">Signed, going live</div>
+              <div className="mini-k">Already won</div>
               <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
-              <div className="mini-s">of {tgt.monthsLocked.toFixed(1)}m</div>
+              <div className="mini-s">signed, going live &middot; target {tgt.monthsLocked.toFixed(1)}m</div>
             </div>
             <div className="mini">
-              <div className="mini-k">Still to sell</div>
+              <div className="mini-k">Still to win</div>
               <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
-              <div className="mini-s">of {tgt.monthsSelling.toFixed(1)}m</div>
+              <div className="mini-s">still to be sold &middot; target {tgt.monthsSelling.toFixed(1)}m</div>
             </div>
             <div className="mini">
-              <div className="mini-k">Moving this week</div>
+              <div className="mini-k">Named to move</div>
               <div className="mini-v">{fmtMoney(flow.named)}</div>
-              <div className="mini-s">of {fmtMoney(flow.need)} needed</div>
+              <div className="mini-s">of {fmtMoney(flow.need)} this week</div>
             </div>
           </div>
         </div>
