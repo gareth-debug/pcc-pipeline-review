@@ -882,6 +882,30 @@ function MoveWorking({ data, repIds, monday }) {
   );
 }
 
+/* Every block on every tab goes through this, so the page reads as numbered
+   chapters rather than one continuous wall. Collapsing is per section and
+   remembered while the tab is open, so a manager can shut what they are not
+   using this week. */
+function Section({ n, title, hint, action, tone: t, children, open: openDefault }) {
+  const [open, setOpen] = useState(openDefault !== false);
+  return (
+    <section className={"sec" + (open ? " open" : "")}>
+      <div className="sec-h">
+        <button className="sec-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+          <span className={"sec-n" + (t ? " tone-" + t : "")}>{n}</span>
+          <span className="sec-titles">
+            <span className="sec-title">{title}</span>
+            {hint ? <span className="sec-hint">{hint}</span> : null}
+          </span>
+          <span className="sec-chev">{open ? "\u25be" : "\u25b8"}</span>
+        </button>
+        {action && open ? <div className="sec-action">{action}</div> : null}
+      </div>
+      {open ? <div className="sec-body">{children}</div> : null}
+    </section>
+  );
+}
+
 function Scorecard({ rows, caption }) {
   const partial = rows.of > 1 && rows.reporting < rows.of;
   return (
@@ -1043,25 +1067,18 @@ function MasterView({ ctx }) {
 
   return (
     <>
-      <div className="section" style={{ marginTop: "18px" }}>
-        <div className="section-h">
-          <h2>Where we are against goal</h2>
-          <span className="hint">everything the model asks for, in one place</span>
-        </div>
+      <Section n="1" title="Where we are against goal"
+        hint="everything the model asks for, in one place"
+        tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
         <Scorecard rows={card} />
-        <p className="faint" style={{ fontSize: "12.5px", marginTop: "12px", fontWeight: 600 }}>
-          Green at or above goal, amber from 80%, red below. Two things are deliberately absent: stage
-          conversion, which needs deals followed over months in Salesforce rather than a weekly snapshot,
-          and days in stage, which is judged per stage in the funnel below. Both matter &mdash; the pipeline
-          figures above are only worth what they are worth if deals are also moving at the budgeted speed.
-        </p>
-      </div>
+      </Section>
 
-      <div className="headline">
+      <Section n="2" title="Pipeline runway"
+        hint="how long the book lasts, and what it is worth"
+        tone={coverTone}>
         <div className="headline-row">
           <Gauge pct={Math.min(coverPct, 999)} tone={coverTone} />
           <div style={{ maxWidth: "560px" }}>
-            <div className="hero-k">Pipeline runway</div>
             <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "22px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
               At {fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month, everything the team is working today
@@ -1080,10 +1097,9 @@ function MasterView({ ctx }) {
             <span className="calc-total">so {fmtMoney(newPipe.added)} of new pipeline built</span>
           </div>
         ) : null}
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h"><h2>This week&rsquo;s focus</h2><span className="hint">biggest gaps first</span></div>
+      <Section n="3" title="This week&rsquo;s focus" hint="biggest gaps first, largest at the top" tone="bad">
         {focus.length === 0 ? (
           <div className="all-clear">Every rep is on target in every stage. Short 1:1s this week.</div>
         ) : (
@@ -1097,13 +1113,9 @@ function MasterView({ ctx }) {
             ))}
           </div>
         )}
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h">
-          <h2>The funnel</h2>
-          <span className="hint">bar is what is held, the pill is what is moving out this week</span>
-        </div>
+      <Section n="4" title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
         <div style={{ marginBottom: "16px" }}>
           <MoveWorking data={data} repIds={ids} monday={monday} />
         </div>
@@ -1164,14 +1176,11 @@ function MasterView({ ctx }) {
           <div className="fun-gap" />
           <div className="fun-days">{base ? <Delta value={cur.total - base.total} /> : null}</div>
         </div>
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h">
-          <h2>The team</h2><span className="hint">runway is months of activation covered &mdash; a healthy book covers {tgt.months.toFixed(1)}</span>
-          <span className="spacer" />
-          <button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>
-        </div>
+      <Section n="5" title="The team"
+        hint={"runway is months of activation covered \u2014 a healthy book covers " + tgt.months.toFixed(1)}
+        action={<button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>}>
         <table className="tbl">
           <thead>
             <tr>
@@ -1254,7 +1263,7 @@ function MasterView({ ctx }) {
             </table>
           </div>
         ) : null}
-      </div>
+      </Section>
     </>
   );
 }
@@ -1318,11 +1327,9 @@ function RepView({ ctx, rep }) {
 
   return (
     <>
-      <div className="section" style={{ marginTop: "18px" }}>
-        <div className="section-h">
-          <h2>{rep.name} against goal</h2>
-          <span className="hint">the same measures as the team view, scored for one book</span>
-        </div>
+      <Section n="1" title={rep.name + " against goal"}
+        hint="the same measures as the team view, scored for one book"
+        tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
         <Scorecard rows={card} />
         <div style={{ marginTop: "14px" }}>
           <CoverWorking data={data} repIds={[rep.id]} />
@@ -1333,17 +1340,13 @@ function RepView({ ctx, rep }) {
             {shortDate(repPipe.since)}, {fmtMoney(repPipe.movedOut)} moved on, {fmtMoney(repPipe.killed)} killed.
           </p>
         ) : null}
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h">
-          <h2>Walk the funnel</h2>
-          <span className="hint">
-            {flow.need - flow.named > 0
-              ? fmtMoney(flow.need - flow.named) + " of movement still to name this week"
-              : "movement for the week is fully named"}
-          </span>
-        </div>
+      <Section n="2" title="Walk the funnel"
+        hint={flow.need - flow.named > 0
+          ? fmtMoney(flow.need - flow.named) + " of movement still to name this week"
+          : "movement for the week is fully named"}
+        tone={flow.need - flow.named > 0 ? "warn" : "good"}>
         <div style={{ marginBottom: "14px" }}>
           <MoveWorking data={data} repIds={[rep.id]} monday={monday} />
         </div>
@@ -1364,6 +1367,7 @@ function RepView({ ctx, rep }) {
             const hasBase = !!b && (b.gpv > 0 || b.avgDays > 0);
             const isOpen = s.id === activeStage;
             const t = tone(f.gpv, f.target);
+            const dv = dwellVerdict(s, f.avgDays);
             const edge = f.state === "move" ? "warn" : (f.state === "ok" ? "good" : "bad");
 
             const nextName = f.next ? f.next.name : "live";
@@ -1502,16 +1506,12 @@ function RepView({ ctx, rep }) {
             );
           })}
         </div>
-      </div>
+      </Section>
 
       {resolved.length ? (
-        <div className="section">
-          <div className="section-h">
-            <h2>Track record</h2>
-            <span className="hint">{st.moved} moved, {st.missed} missed, {st.dead} disqualified</span>
-            <span className="spacer" />
-            <button className="btn txt" onClick={() => setShowHist(!showHist)}>{showHist ? "Hide" : "Show all " + resolved.length}</button>
-          </div>
+        <Section n="3" title="Track record" open={false}
+          hint={st.moved + " moved, " + st.missed + " missed, " + st.dead + " disqualified"}
+          action={<button className="btn txt" onClick={() => setShowHist(!showHist)}>{showHist ? "Hide" : "Show all " + resolved.length}</button>}>
           {showHist ? (
             <table className="tbl">
               <thead>
@@ -1536,11 +1536,10 @@ function RepView({ ctx, rep }) {
               </tbody>
             </table>
           ) : null}
-        </div>
+        </Section>
       ) : null}
 
-      <div className="section">
-        <div className="section-h"><h2>1:1 note</h2></div>
+      <Section n="4" title="1:1 note" hint="carried across weeks, visible to everyone">
         <textarea
           className="note"
           value={note}
@@ -1549,7 +1548,7 @@ function RepView({ ctx, rep }) {
           onBlur={() => onEditing(-1)}
           onChange={(e) => actions.setNote(rep.id, e.target.value)}
         />
-      </div>
+      </Section>
     </>
   );
 }
@@ -1565,11 +1564,7 @@ function SettingsView({ ctx }) {
 
   return (
     <>
-      <div className="section">
-        <div className="section-h">
-          <h2>The model</h2>
-          <span className="hint">fixed targets, sized from the activation goal &mdash; nothing here is editable</span>
-        </div>
+      <Section n="1" title="The model" hint="fixed targets, sized from the activation goal &mdash; nothing here is editable">
         <p className="muted" style={{ marginTop: 0, maxWidth: "740px", fontSize: "14px" }}>
           Every rep carries <b>{fmtMoney(PER_REP_TARGET)}</b> of pipeline. It is not a round number someone
           picked: it is what has to sit in the book to get <b>{fmtMoney(ACTIVATION_PER_MONTH)} a month</b> live,
@@ -1713,10 +1708,9 @@ function SettingsView({ ctx }) {
           target, they are months of stock standing still, and the app marks that stage as stuck rather
           than green.
         </p>
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h"><h2>Reps</h2><span className="hint">unticking keeps history and drops them from the team total, but every active rep still carries the full per-rep target</span></div>
+      <Section n="2" title="Reps" hint="unticking keeps history and drops them from the team total, but every active rep still carries the full per-rep target">
         <table className="tbl">
           <thead>
             <tr><th>Name</th><th className="nar">Active</th><th className="r nar">Pipeline</th><th className="r nar">Target</th><th className="r nar">Gap</th><th className="r nar" /></tr>
@@ -1742,10 +1736,9 @@ function SettingsView({ ctx }) {
         <div className="row-acts">
           <button className="btn primary" onClick={actions.addRep}>Add rep</button>
         </div>
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h"><h2>Captures</h2><span className="hint">Monday captures set the baseline; manual ones are history only</span></div>
+      <Section n="3" title="Captures" hint="Monday captures set the baseline; manual ones are history only" open={false}>
         <table className="tbl">
           <thead>
             <tr><th className="nar">Week of</th><th className="nar">Taken</th><th className="nar">Kind</th><th className="r nar">Pipeline then</th><th className="r nar" /></tr>
@@ -1767,10 +1760,9 @@ function SettingsView({ ctx }) {
             })}
           </tbody>
         </table>
-      </div>
+      </Section>
 
-      <div className="section">
-        <div className="section-h"><h2>Data</h2><span className="hint">nothing here is lost by redeploying the app</span></div>
+      <Section n="4" title="Data" hint="nothing here is lost by redeploying the app" open={false}>
         <div className="row-acts">
           <button className="btn" onClick={actions.copyBackup}>Copy everything as JSON</button>
           <button className="btn" onClick={actions.loadSample}>Load sample numbers</button>
@@ -1780,7 +1772,7 @@ function SettingsView({ ctx }) {
           Sample numbers fill every rep and a prior week so you can see the tool working. Clearing wipes
           GPV, days, commits and captures but keeps your reps, stages, floors and targets.
         </p>
-      </div>
+      </Section>
     </>
   );
 }
@@ -2189,7 +2181,7 @@ export default function App() {
         {tab === "settings" ? <SettingsView ctx={ctx} /> : null}
         {currentRep ? <RepView key={currentRep.id} ctx={ctx} rep={currentRep} /> : null}
         {tab !== "master" && tab !== "settings" && !currentRep ? (
-          <div className="section"><p className="empty">That tab no longer exists. Pick another above.</p></div>
+          <div className="sec"><div className="sec-body"><p className="empty">That tab no longer exists. Pick another above.</p></div></div>
         ) : null}
       </main>
       {undo ? (
@@ -2247,14 +2239,8 @@ body{background:var(--paper);color:var(--ink);font-family:var(--font);font-size:
 .tab.sep{margin-left:auto}
 
 main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
-.section{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:26px 26px;margin-top:22px}
-.section-h{display:flex;align-items:baseline;gap:12px;margin:0 0 20px;flex-wrap:wrap}
-.section-h h2{margin:0;font-size:16px;font-weight:700;letter-spacing:-.02em}
-.section-h .hint{font-size:12.5px;color:var(--faint);font-weight:500}
-.section-h .spacer{margin-left:auto}
 
 /* ---------------- headline ---------------- */
-.headline{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:24px;margin-top:18px}
 .headline-row{display:flex;align-items:center;gap:32px;flex-wrap:wrap}
 .hero-k{font-size:13px;color:var(--slate);font-weight:600;margin-bottom:4px}
 .hero-v{font-size:42px;line-height:1.05;letter-spacing:-.04em;font-weight:800}
@@ -2416,6 +2402,29 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .spark-line.bad{stroke:var(--bad-bar)}
 .spark-line.good{stroke:var(--good-bar)}
 
+.sec{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);margin-top:26px;overflow:hidden}
+.sec-h{display:flex;align-items:center;gap:12px;padding:4px 22px 4px 8px}
+.sec.open .sec-h{border-bottom:1px solid var(--line)}
+.sec-toggle{flex:1;display:flex;align-items:center;gap:14px;background:none;border:0;padding:18px 14px;
+  font:inherit;color:inherit;cursor:pointer;text-align:left;min-width:0}
+.sec-toggle:hover .sec-title{color:var(--accent)}
+.sec-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:-4px;border-radius:8px}
+.sec-n{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;flex:none;
+  border-radius:10px;background:var(--paper);color:var(--slate);font-size:13px;font-weight:800}
+.sec-n.tone-good{background:var(--good-bg);color:var(--good)}
+.sec-n.tone-warn{background:var(--warn-bg);color:var(--warn)}
+.sec-n.tone-bad{background:var(--bad-bg);color:var(--bad)}
+.sec-titles{display:flex;flex-direction:column;gap:2px;min-width:0}
+.sec-title{font-size:16.5px;font-weight:750;letter-spacing:-.02em}
+.sec-hint{font-size:12.5px;color:var(--faint);font-weight:500}
+.sec-chev{margin-left:auto;color:var(--faint);font-size:12px;flex:none}
+.sec-action{flex:none}
+.sec-body{padding:24px 26px 26px}
+@media (max-width:620px){
+  .sec-body{padding:18px 16px 20px}
+  .sec-toggle{padding:16px 8px;gap:11px}
+  .sec-title{font-size:15px}
+}
 .undo{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:60;display:flex;align-items:center;gap:14px;
   background:var(--ink);color:#fff;padding:12px 16px;border-radius:999px;font-size:13.5px;font-weight:600;
   box-shadow:0 8px 28px -8px rgba(27,35,51,.5);max-width:calc(100vw - 32px)}
