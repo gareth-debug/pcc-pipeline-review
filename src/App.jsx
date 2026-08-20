@@ -1144,11 +1144,11 @@ function MasterView({ ctx }) {
                 ) : null}
               </div>
               <div className="fun-days">
-                {fmtDays(a.avgDays)}
-                <div className="faint" style={{ fontSize: "11.5px", fontWeight: 700, marginTop: "2px" }}>
-                  {a.avgDays > 0 && dwellVerdict(st, a.avgDays)
-                    ? dwellVerdict(st, a.avgDays).text
-                    : "budget " + st.dwellDays + "d"}
+                <span className={a.avgDays > 0 && dwellVerdict(st, a.avgDays) ? "tone-" + dwellVerdict(st, a.avgDays).tone : ""}>
+                  {a.avgDays > 0 ? Math.round(a.avgDays) + "d" : "\u2014"}
+                </span>
+                <div className="faint" style={{ fontSize: "11.5px", fontWeight: 600, marginTop: "2px" }}>
+                  {st.dwellDays}d target
                 </div>
                 <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}>
                   <DaysTrend trends={daysTrends(data, ids, st.id, monday)} compact />
@@ -1347,6 +1347,13 @@ function RepView({ ctx, rep }) {
         <div style={{ marginBottom: "14px" }}>
           <MoveWorking data={data} repIds={[rep.id]} monday={monday} />
         </div>
+        <div className="walk-head">
+          <div>Stage</div><div />
+          <div>GPV held</div>
+          <div>Moving out</div>
+          <div>Days in stage</div>
+          <div style={{ textAlign: "right" }}>This week</div>
+        </div>
         <div className="walk">
           {stages.map((s, i) => {
             const f = stageFlow(data, rep.id, i);
@@ -1384,24 +1391,28 @@ function RepView({ ctx, rep }) {
                 <button className="st-row" onClick={() => setOpenStage(isOpen ? "__none__" : s.id)}>
                   <span className="st-name">
                     <span className="st-chev">{"\u25b6"}</span>
-                    <span className="idx">{i + 1}</span>{s.name}
+                    <span className={"idx st-idx tone-" + edge}>{i + 1}</span>{s.name}
                   </span>
                   <Bar value={f.gpv} target={f.target} scale={scale} tone={t} pledged={f.pledgedIn} />
-                  <span className="st-fig">
-                    {fmtMoney(f.gpv)}<span className="of"> / {fmtMoney(f.target)}</span>
-                    <span className="st-sub">
-                      {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} out
+                  <span className="st-col">
+                    <span className="st-big">{fmtMoney(f.gpv)}</span>
+                    <span className="st-small">of {fmtMoney(f.target)}</span>
+                  </span>
+                  <span className="st-col">
+                    <span className={"st-big " + (f.outShort > 0 ? "tone-warn" : "tone-good")}>{fmtMoney(f.pledgedOut)}</span>
+                    <span className="st-small">of {fmtMoney(f.outNeed)}</span>
+                  </span>
+                  <span className="st-col">
+                    <span className={"st-big " + (dv ? "tone-" + dv.tone : "faint")}>
+                      {f.avgDays > 0 ? Math.round(f.avgDays) + "d" : "\u2014"}
                     </span>
-                    <span className="st-sub">
-                      {f.avgDays > 0
-                        ? fmtDays(f.avgDays) + " \u00b7 " + (dwellVerdict(s, f.avgDays)
-                            ? dwellVerdict(s, f.avgDays).text
-                            : "budget " + s.dwellDays + "d")
-                        : "no days entered \u00b7 budget " + s.dwellDays + "d"}
+                    <span className="st-small">
                       {(() => {
-                        const t = daysTrends(data, [rep.id], s.id, monday).filter((x) => x.ok)[0];
-                        if (!t || Math.abs(t.pct) < 1) return "";
-                        return (t.pct < 0 ? " \u2193" : " \u2191") + Math.abs(Math.round(t.pct)) + "% 1w";
+                        const tr = daysTrends(data, [rep.id], s.id, monday).filter((x) => x.ok)[0];
+                        if (tr && Math.abs(tr.pct) >= 1) {
+                          return (tr.pct < 0 ? "\u2193" : "\u2191") + Math.abs(Math.round(tr.pct)) + "% this week";
+                        }
+                        return s.dwellDays + "d target";
                       })()}
                     </span>
                   </span>
@@ -1442,10 +1453,7 @@ function RepView({ ctx, rep }) {
                       <span className="st-f">
                         <label>median days in stage</label>
                         <DaysInput value={f.avgDays} onEditing={onEditing} onCommit={(v) => actions.setCell(rep.id, s.id, "avgDays", v)} />
-                        <span className="faint" style={{ fontSize: "12px", fontWeight: 700 }}>budget {s.dwellDays}d</span>
-                        {dwellVerdict(s, f.avgDays) ? (
-                          <Pill tone={dwellVerdict(s, f.avgDays).tone}>{dwellVerdict(s, f.avgDays).text}</Pill>
-                        ) : null}
+                        <span className="faint" style={{ fontSize: "12px", fontWeight: 600 }}>target {s.dwellDays}d</span>
                       </span>
                       <span className="st-f">
                         <label>trend</label>
@@ -1853,6 +1861,8 @@ export default function App() {
   const [data, setData] = useState(null);
   const [tab, setTab] = useState("master");
   const [showMatrix, setShowMatrix] = useState(false);
+  const [undo, setUndo] = useState(null);
+  const undoRef = useRef(null);
   const [status, setStatus] = useState({ kind: "load", text: "Loading" });
 
   const dataRef = useRef(null);
@@ -1864,6 +1874,15 @@ export default function App() {
   const timerRef = useRef(null);
   const storageOkRef = useRef(false);
   const doSaveRef = useRef(null);
+
+  useEffect(() => { undoRef.current = undo; }, [undo]);
+
+  /* The offer expires rather than lingering over the next thing the rep does. */
+  useEffect(() => {
+    if (!undo) return undefined;
+    const t = setTimeout(() => setUndo(null), 12000);
+    return () => clearTimeout(t);
+  }, [undo]);
 
   const onEditing = useCallback((delta) => {
     editingRef.current = Math.max(0, editingRef.current + delta);
@@ -2073,11 +2092,23 @@ export default function App() {
     setCommit(id, field, value) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) c[field] = value; }); },
     resolveCommit(id, st) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) { c.status = st; c.resolvedWeek = thisMonday(); } }); },
     reopenCommit(id) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) { c.status = "open"; c.resolvedWeek = null; } }); },
+    /* Deleting is for mistakes and experiments, so it happens immediately with
+       no dialog. Undo covers the accident; Moved, Missed and Dead cover the
+       cases that belong on the record. */
     deleteCommit(id) {
       const c = dataRef.current.commits.find((x) => x.id === id);
-      if (!window.confirm("Delete " + (c && c.name ? c.name : "this commit") + "? Marking it missed keeps it on the record.")) return;
       update((d) => { d.commits = d.commits.filter((x) => x.id !== id); });
+      if (c) setUndo({ commit: c, at: Date.now() });
     },
+    undoDelete() {
+      const u = undoRef.current;
+      if (!u) return;
+      update((d) => {
+        if (!d.commits.some((x) => x.id === u.commit.id)) d.commits.push(u.commit);
+      });
+      setUndo(null);
+    },
+    dismissUndo() { setUndo(null); },
     captureNow() {
       update((d) => { d.snapshots.push(makeSnapshot(d, thisMonday(), false)); });
       setStatus({ kind: "ok", text: "Snapshot captured" });
@@ -2112,7 +2143,7 @@ export default function App() {
         setStatus({ kind: "err", text: "Clipboard not available here" });
       }
     }
-  }), [update]);
+  }), [update, undo]);
 
   if (!data) {
     return <div className="app"><Styles /><div style={{ padding: "64px 24px", color: "#6B7793" }}>{status.text}</div></div>;
@@ -2161,6 +2192,15 @@ export default function App() {
           <div className="section"><p className="empty">That tab no longer exists. Pick another above.</p></div>
         ) : null}
       </main>
+      {undo ? (
+        <div className="undo" role="status">
+          <span>
+            Deleted <b>{undo.commit.name ? undo.commit.name : "an unnamed commit"}</b>
+          </span>
+          <button className="undo-btn" onClick={actions.undoDelete}>Undo</button>
+          <button className="undo-x" onClick={actions.dismissUndo} title="Dismiss">×</button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2186,7 +2226,7 @@ function Styles() {
 html,body{margin:0;padding:0}
 body{background:var(--paper);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5;
   -webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}
-.num,.st-fig,.hero-v,.mini-v,.fun-gpv{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.num,.st-big,.hero-v,.mini-v,.fun-gpv{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
 .app{min-height:100vh}
 
 /* ---------------- header ---------------- */
@@ -2207,8 +2247,8 @@ body{background:var(--paper);color:var(--ink);font-family:var(--font);font-size:
 .tab.sep{margin-left:auto}
 
 main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
-.section{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:22px 24px;margin-top:18px}
-.section-h{display:flex;align-items:baseline;gap:12px;margin:0 0 16px;flex-wrap:wrap}
+.section{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:26px 26px;margin-top:22px}
+.section-h{display:flex;align-items:baseline;gap:12px;margin:0 0 20px;flex-wrap:wrap}
 .section-h h2{margin:0;font-size:16px;font-weight:700;letter-spacing:-.02em}
 .section-h .hint{font-size:12.5px;color:var(--faint);font-weight:500}
 .section-h .spacer{margin-left:auto}
@@ -2265,7 +2305,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .fun-head{display:grid;grid-template-columns:170px 1fr 116px 116px 118px;gap:16px;padding:0 0 10px;
   font-size:11.5px;color:var(--faint);font-weight:700;border-bottom:1px solid var(--line)}
 .fun-row{display:grid;grid-template-columns:170px 1fr 116px 116px 118px;gap:16px;align-items:center;
-  padding:15px 0;border-bottom:1px solid var(--line)}
+  padding:18px 0;border-bottom:1px solid var(--line)}
 .fun-row:last-of-type{border-bottom:0}
 .fun-name{font-size:14.5px;font-weight:650;display:flex;align-items:center;gap:10px}
 .idx{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;
@@ -2303,7 +2343,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .muted{color:var(--slate)}
 .faint{color:var(--faint)}
 .empty{padding:20px 0;color:var(--slate)}
-.score td{padding-top:14px;padding-bottom:14px}
+.score td{padding-top:17px;padding-bottom:17px}
 .score-label{font-size:14.5px;font-weight:650;letter-spacing:-.01em}
 .score-note{font-size:12px;color:var(--faint);margin-top:2px;font-weight:500}
 .tbl .prog{width:190px;min-width:120px}
@@ -2376,20 +2416,39 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .spark-line.bad{stroke:var(--bad-bar)}
 .spark-line.good{stroke:var(--good-bar)}
 
+.undo{position:fixed;left:50%;transform:translateX(-50%);bottom:24px;z-index:60;display:flex;align-items:center;gap:14px;
+  background:var(--ink);color:#fff;padding:12px 16px;border-radius:999px;font-size:13.5px;font-weight:600;
+  box-shadow:0 8px 28px -8px rgba(27,35,51,.5);max-width:calc(100vw - 32px)}
+.undo b{font-weight:800}
+.undo-btn{background:none;border:0;color:#9DBBFF;font:inherit;font-weight:800;cursor:pointer;padding:2px 4px}
+.undo-btn:hover{color:#fff;text-decoration:underline;text-underline-offset:3px}
+.undo-x{background:none;border:0;color:rgba(255,255,255,.55);font:inherit;font-size:16px;cursor:pointer;padding:0 2px;line-height:1}
+.undo-x:hover{color:#fff}
 .preview-note{margin:16px 0 0;padding:11px 16px;background:var(--accent-bg);border-radius:var(--r-sm);
   font-size:13px;color:#4457B8;font-weight:600}
 .matrix-wrap{overflow-x:auto}
 
 /* ---------------- stage walk ---------------- */
-.walk{display:flex;flex-direction:column;gap:8px}
+.walk{display:flex;flex-direction:column;gap:10px}
 .st{border:1.5px solid var(--line);border-radius:var(--r-sm);overflow:hidden;transition:border-color .12s}
 .st:hover{border-color:#D9E1EC}
 .st.open{border-color:#D0D9E8;background:var(--card)}
 .st.tone-bad{border-left:4px solid var(--bad-bar)}
 .st.tone-warn{border-left:4px solid var(--warn-bar)}
 .st.tone-good{border-left:4px solid var(--good-bar)}
-.st-row{display:grid;grid-template-columns:1fr 170px 128px 132px;gap:18px;align-items:center;
-  padding:15px 18px;cursor:pointer;background:none;border:0;width:100%;text-align:left;font:inherit;color:inherit}
+.walk-head{display:grid;grid-template-columns:1fr 150px 108px 108px 92px 116px;gap:16px;
+  padding:0 18px 10px;font-size:11px;font-weight:700;color:var(--faint);letter-spacing:.02em}
+.st-row{display:grid;grid-template-columns:1fr 150px 108px 108px 92px 116px;gap:16px;align-items:center;
+  padding:18px;cursor:pointer;background:none;border:0;width:100%;text-align:left;font:inherit;color:inherit}
+.st-col{display:flex;flex-direction:column;gap:2px;min-width:0}
+.st-big{font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
+.st-small{font-size:11.5px;color:var(--faint);font-weight:600;white-space:nowrap}
+.tone-good{color:var(--good)}
+.tone-warn{color:var(--warn)}
+.tone-bad{color:var(--bad)}
+.idx.st-idx.tone-good{background:var(--good-bg);color:var(--good)}
+.idx.st-idx.tone-warn{background:var(--warn-bg);color:var(--warn)}
+.idx.st-idx.tone-bad{background:var(--bad-bg);color:var(--bad)}
 .st-row:hover{background:var(--paper)}
 .st-row:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
 .st-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px;letter-spacing:-.01em}
@@ -2401,17 +2460,14 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .st-fill.bad{background:var(--bad-bar)}
 .st-pledge{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(45deg,#BFE3D5,#BFE3D5 4px,transparent 4px,transparent 8px);border-radius:0 999px 999px 0}
 .st-tick{position:absolute;top:-4px;bottom:-4px;width:3px;border-radius:2px;background:var(--ink)}
-.st-fig{text-align:right;font-size:15px;font-weight:700;letter-spacing:-.02em}
-.st-fig .of{color:var(--faint);font-size:13px;font-weight:600}
-.st-sub{display:block;font-size:12.5px;color:var(--faint);margin-top:3px;font-weight:600;white-space:nowrap}
 .st-state{text-align:right}
-.st-body{padding:4px 18px 20px 18px;border-top:1px solid var(--line);background:var(--card)}
+.st-body{padding:6px 18px 24px 18px;border-top:1px solid var(--line);background:var(--card)}
 .st-lead{font-size:14.5px;color:var(--ink-2);margin:16px 0;max-width:660px;font-weight:500}
 .st-lead em{font-style:normal;font-weight:800;color:var(--ink)}
 .st-lead.short em{color:var(--bad)}
 .st-lead.covered em{color:var(--good)}
-.st-fields{display:flex;gap:22px;align-items:center;flex-wrap:wrap;margin-bottom:18px;
-  background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
+.st-fields{display:flex;gap:26px;align-items:center;flex-wrap:wrap;margin-bottom:20px;
+  background:var(--paper);border-radius:var(--r-sm);padding:16px 18px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
 .unit{font-size:13px;font-weight:700;color:var(--slate);margin-left:5px}
@@ -2454,7 +2510,8 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   main{padding:8px 14px 72px}
   .head-top,.tabs{padding-left:14px;padding-right:14px}
   .section,.headline{padding:18px 16px}
-  .st-row{grid-template-columns:1fr 118px;gap:10px}
+  .walk-head{display:none}
+  .st-row{grid-template-columns:1fr 96px 92px;gap:10px;padding:14px}
   .st-bar,.st-state{display:none}
   .cmt{grid-template-columns:1fr 96px;gap:9px}
   .focus-row{grid-template-columns:1fr auto;gap:8px}
