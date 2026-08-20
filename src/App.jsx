@@ -624,15 +624,6 @@ function scorecard(d, repIds, mondayIso) {
      seven reps' target. */
   const onTarget = stages.filter((st) => cur.byStage[st.id].gpv >= (Number(st.floor) || 0) * n).length;
 
-  /* The book target is only valid at the budgeted speed. Holding enough while
-     running slow produces the worst outcome available: every GPV number green
-     and the activation goal still missed. So speed gets its own line. */
-  const measurable = stages.filter((st) => cur.byStage[st.id].avgDays > 0);
-  const atPace = measurable.filter((st) => {
-    const v = dwellVerdict(st, cur.byStage[st.id].avgDays);
-    return v && v.tone === "good";
-  }).length;
-
   const row = (label, now, goal, fmt, note) => ({
     label, now, goal, note,
     text: fmt(now), goalText: fmt(goal),
@@ -660,11 +651,7 @@ function scorecard(d, repIds, mondayIso) {
     row("Moving up a stage", flow.named, flow.need, money, "named this week"),
     row("Activated", activated, activationGoal, money, "left the final stage this week"),
     row("Runway", cover.months, tgt.months, months, "how long the book lasts"),
-    row("Stages on target", onTarget, stages.length, count, "GPV at or above the floor"),
-    row("Stages at pace", atPace, measurable.length || stages.length, count,
-        measurable.length
-          ? "within the dwell budget \u2014 the book target assumes this"
-          : "no days entered, so pace cannot be confirmed")
+    row("Stages on target", onTarget, stages.length, count, "GPV at or above the floor")
   ];
   rows.reporting = reporting;
   rows.of = n;
@@ -1063,9 +1050,10 @@ function MasterView({ ctx }) {
         </div>
         <Scorecard rows={card} />
         <p className="faint" style={{ fontSize: "12.5px", marginTop: "12px", fontWeight: 600 }}>
-          Green at or above goal, amber from 80%, red below. Stage conversion is not on this list because it
-          cannot be measured here &mdash; it needs deals followed over months in Salesforce. The rates the
-          model runs on are in Settings.
+          Green at or above goal, amber from 80%, red below. Two things are deliberately absent: stage
+          conversion, which needs deals followed over months in Salesforce rather than a weekly snapshot,
+          and days in stage, which is judged per stage in the funnel below. Both matter &mdash; the pipeline
+          figures above are only worth what they are worth if deals are also moving at the budgeted speed.
         </p>
       </div>
 
