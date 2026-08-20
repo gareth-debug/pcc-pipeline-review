@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 11;
+const DATA_VERSION = 12;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -178,52 +178,51 @@ function commitStats(commits, repId, mondayIso) {
    THE MODEL. These figures are locked: nothing in the interface edits them.
    Changing them means editing this block and redeploying.
 
-   CONVERSION is measured, not assumed. Source: 19,720 closed US field
-   opportunities created Feb 2025 - May 2026, stage-to-stage, GPV-weighted.
-   GPV-weighted rather than by opportunity count, because counting a $200K deal
-   and a $5M deal identically flatters the funnel: by count the org converts
-   16.4% from Discovery, by GPV only 12.6%. The gap is generated almost entirely
-   in the two commercial gates, where large deals convert 6-9 points worse.
+   THIS IS A PLAN, NOT A DESCRIPTION OF TODAY. It is built backwards from two
+   decisions: every rep activates $4M a month, and every rep builds $6M a week
+   of new Discovery. Those two numbers only meet if 15.4% of Discovery GPV ends
+   up live. The team currently converts 12.6%. So the plan requires a conversion
+   improvement, and if that improvement does not arrive, $6M a week produces
+   about $3.3M a month however well the rest of the funnel is worked.
 
-   A 10% haircut is then applied to every gate, giving 11.3% overall. That is
-   deliberate and it is not padding. The source measures furthest-stage-reached,
-   so a deal that skipped a stage still counts as having passed its gate, which
-   biases every measured rate upward. Sizing on the raw figure risks the one
-   outcome worth avoiding: a team that hits every target in this app and still
-   misses the activation goal. Sized this way, if conversion turns out to be the
-   full 12.6%, the book delivers $4.3M a month rather than $4.0M. Overshoot, not
-   shortfall.
+   The improvement is not invented. The same funnel already converts 16.4% when
+   measured by opportunity count instead of GPV: large deals convert worse, and
+   almost all of the damage is in two gates. Evaluation to Negotiation loses
+   5.9 points on GPV versus count, and Negotiation to Mutual close plan loses
+   8.6. Closing three quarters of that gap gets to 15.4% without touching
+   Discovery, which shows almost no size penalty at all. So this is a
+   commercial-execution target on large deals, not a prospecting target.
 
-   Over half of every dollar entering Discovery dies there. That single gate
-   loses more than the other four combined.
+   CONVERSION below is that required rate, gate by gate. The measured GPV rate
+   is kept alongside it so the size of the ask stays visible.
 
-   DWELL is a budget, not a measurement. The measured figures cannot be trusted
-   in absolute terms: they come from weekly snapshots, so a deal lingering for
-   months contributes many rows and drags the median up. The budget below spends
-   the 12-week outcome rule across the four selling stages, and leaves
-   Implementation at its observed figure.
+   DWELL is a budget: the 12-week outcome rule spread across the four selling
+   stages, with Implementation left at its observed figure. Measured dwell comes
+   from weekly snapshots and is not reliable in absolute terms.
 
    HOLDINGS follow from throughput: what sits in a stage is the volume flowing
-   through it times how long it sits there. Verified by simulation as well as by
-   formula.
-
-   THE BINDING CONSTRAINT is the top of the funnel, not the book. Sustaining
-   this needs $35.3M of new Discovery per rep per month, which is $8.15M a week.
-   The team is currently asked for $6M a week; that supports roughly $2.9M of
-   activation, not $4M.
+   through it times how long it sits there. Note that the book is SMALLER than
+   the version built on today's conversion. That is not a softer target: fewer
+   deals are needed to produce the same wins precisely because more of them
+   survive. Hitting the book while converting at today's rate misses the goal.
    --------------------------------------------------------------------------- */
-const PER_REP_TARGET = 51.5e6;       // sum of the stage targets below
 const ACTIVATION_PER_MONTH = 4e6;    // GPV each rep must get live every month
-const NEW_PIPELINE_PER_WEEK = 8.15e6; // new Discovery GPV needed to sustain it
+const NEW_PIPELINE_PER_WEEK = 6e6;   // new Discovery GPV each rep builds weekly
+const CONVERSION_REQUIRED = 0.1538;  // what those two numbers imply
+const CONVERSION_MEASURED = 0.126;   // what the team does today, GPV-weighted
 
-/* conv = measured GPV-weighted gate, less the 10% haircut explained above */
 const STAGE_MODEL = [
-  { id: "st_discovery",      name: "Discovery",         floor: 24.72e6, dwellDays: 21, conv: 0.4269, measuredConv: 0.436 },
-  { id: "st_evaluation",     name: "Evaluation",        floor: 9.55e6,  dwellDays: 19, conv: 0.6090, measuredConv: 0.622 },
-  { id: "st_negotiation",    name: "Negotiation",       floor: 7.96e6,  dwellDays: 26, conv: 0.6296, measuredConv: 0.643 },
-  { id: "st_closeplan",      name: "Mutual close plan", floor: 3.47e6,  dwellDays: 18, conv: 0.8362, measuredConv: 0.854 },
-  { id: "st_implementation", name: "Implementation",    floor: 5.80e6,  dwellDays: 36, conv: 0.8274, measuredConv: 0.845 }
+  { id: "st_discovery",      name: "Discovery",         floor: 18.20e6, dwellDays: 21, conv: 0.4405, measuredConv: 0.436 },
+  { id: "st_evaluation",     name: "Evaluation",        floor: 7.25e6,  dwellDays: 19, conv: 0.6663, measuredConv: 0.622 },
+  { id: "st_negotiation",    name: "Negotiation",       floor: 6.61e6,  dwellDays: 26, conv: 0.7075, measuredConv: 0.643 },
+  { id: "st_closeplan",      name: "Mutual close plan", floor: 3.24e6,  dwellDays: 18, conv: 0.8735, measuredConv: 0.854 },
+  { id: "st_implementation", name: "Implementation",    floor: 5.66e6,  dwellDays: 36, conv: 0.8488, measuredConv: 0.845 }
 ];
+
+/* Derived, never typed. A hand-rounded total that sits a hair above the sum of
+   the rounded stage figures means a rep holding every stage target exactly can
+   never show green. */
+const PER_REP_TARGET = STAGE_MODEL.reduce((a, s) => a + s.floor, 0);
 
 /* What the measured cycle actually was, kept so the budget has something to be
    read against in Settings. */
@@ -1592,6 +1591,24 @@ function SettingsView({ ctx }) {
           absolute terms. The budget spends the 12-week outcome rule across the four selling stages instead.
         </p>
         <p className="st-risk" style={{ maxWidth: "740px", marginTop: "12px" }}>
+          <b>This plan assumes conversion improves.</b> It is built backwards from two decisions:{" "}
+          {fmtMoney(ACTIVATION_PER_MONTH)} activated a month and {fmtMoney(NEW_PIPELINE_PER_WEEK)} of new
+          Discovery a week. Those only meet if <b>{(CONVERSION_REQUIRED * 100).toFixed(1)}%</b> of Discovery
+          GPV ends up live. Today the team converts <b>{(CONVERSION_MEASURED * 100).toFixed(1)}%</b>. At that
+          rate, {fmtMoney(NEW_PIPELINE_PER_WEEK)} a week produces about{" "}
+          {fmtMoney(NEW_PIPELINE_PER_WEEK * WEEKS_PER_MONTH * CONVERSION_MEASURED)} a month, not{" "}
+          {fmtMoney(ACTIVATION_PER_MONTH)} &mdash; and no amount of work in the later stages fixes that,
+          because holding more in Negotiation cannot create deals that never entered Discovery.
+        </p>
+        <p className="muted" style={{ maxWidth: "740px", marginTop: "10px", fontSize: "13.5px" }}>
+          The improvement is not invented. This funnel already converts <b>16.4%</b> measured by opportunity
+          count rather than GPV, which means large deals convert worse than small ones. Almost all of the
+          damage is in two gates: Evaluation to Negotiation loses 5.9 points on GPV versus count, and
+          Negotiation to Mutual close plan loses 8.6. Closing three quarters of that gap reaches{" "}
+          {(CONVERSION_REQUIRED * 100).toFixed(1)}% without improving Discovery at all, which shows almost no
+          size penalty. So the ask is commercial execution on large deals, not more prospecting.
+        </p>
+        <p className="muted" style={{ maxWidth: "740px", marginTop: "10px", fontSize: "13.5px" }}>
           <b>The {fmtMoney(PER_REP_TARGET)} only holds at the budgeted speed.</b> Pipeline needed is flow times
           how long deals sit, so a slower book needs a bigger one: at the cycle this team currently runs, the
           same activation target would need roughly <b>$97M</b> per rep rather than {fmtMoney(PER_REP_TARGET)}.
@@ -1614,7 +1631,7 @@ function SettingsView({ ctx }) {
               <th>Stage</th>
               <th className="r nar">Measured</th>
               <th className="r nar">Budget</th>
-              <th className="r nar">Conversion used</th>
+              <th className="r nar">Conversion needed</th>
               <th className="r nar">So hold</th>
               <th className="r nar">Move out weekly</th>
               <th className="r nar">Team of {n}</th>
@@ -1626,7 +1643,13 @@ function SettingsView({ ctx }) {
                 <td><span className="idx">{i + 1}</span> {st.name}</td>
                 <td className="r nar muted">{MEASURED_DWELL[st.id] || "\u2014"}d</td>
                 <td className="r nar strong">{st.dwellDays}d</td>
-                <td className="r nar muted">{(st.conv * 100).toFixed(1)}%<span className="faint" style={{ fontSize: "11px" }}> &nbsp;measured {(st.measuredConv * 100).toFixed(1)}%</span></td>
+                <td className="r nar muted">
+                  {(st.conv * 100).toFixed(1)}%
+                  <span className="faint" style={{ fontSize: "11px" }}>
+                    &nbsp;now {(st.measuredConv * 100).toFixed(1)}%
+                    {st.conv - st.measuredConv > 0.005 ? ", lift " + ((st.conv - st.measuredConv) * 100).toFixed(1) + "pt" : ""}
+                  </span>
+                </td>
                 <td className="r nar strong">{fmtMoney(st.floor)}</td>
                 <td className="r nar strong">{fmtMoney(weeklyOutflowNeed(i))}</td>
                 <td className="r nar muted">{fmtMoney(teamFloor(data, st))} held</td>
