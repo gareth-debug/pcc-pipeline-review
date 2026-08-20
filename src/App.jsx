@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 8;
+const DATA_VERSION = 11;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -157,12 +157,17 @@ function commitStats(commits, repId, mondayIso) {
   const thisWeek = mine.filter((c) => c.weekOf === mondayIso);
   const moved = mine.filter((c) => c.status === "moved");
   const missed = mine.filter((c) => c.status === "missed");
+  const dead = mine.filter((c) => c.status === "dead");
+  /* Killing a deal is a decision, not a failure, so it sits outside the hit
+     rate. Hit rate is only about deals that were meant to move and did or
+     did not. Disqualifications are counted on their own. */
   const resolved = moved.length + missed.length;
   const sum = (a) => a.reduce((x, c) => x + (Number(c.gpv) || 0), 0);
   return {
     open, thisWeek,
     openGpv: sum(open), thisWeekGpv: sum(thisWeek),
-    moved: moved.length, missed: missed.length, resolved,
+    moved: moved.length, missed: missed.length, dead: dead.length,
+    deadGpv: sum(dead), resolved,
     hitRate: resolved ? moved.length / resolved : null
   };
 }
@@ -173,30 +178,60 @@ function commitStats(commits, repId, mondayIso) {
    THE MODEL. These figures are locked: nothing in the interface edits them.
    Changing them means editing this block and redeploying.
 
-   Sized from throughput rather than opinion. Little's Law says what sits in a
-   stage equals the rate flowing through it times how long it sits there. So we
-   start at the activation target, divide back through each stage's conversion
-   rate to get the flow that must enter it, then multiply by dwell time.
+   CONVERSION is measured, not assumed. Source: 19,720 closed US field
+   opportunities created Feb 2025 - May 2026, stage-to-stage, GPV-weighted.
+   GPV-weighted rather than by opportunity count, because counting a $200K deal
+   and a $5M deal identically flatters the funnel: by count the org converts
+   16.4% from Discovery, by GPV only 12.6%. The gap is generated almost entirely
+   in the two commercial gates, where large deals convert 6-9 points worse.
 
-   At these conversion rates a $90M book sustains roughly $3.1M activated per
-   month. $4M/month would need about $113M. See Settings for the full working.
+   A 10% haircut is then applied to every gate, giving 11.3% overall. That is
+   deliberate and it is not padding. The source measures furthest-stage-reached,
+   so a deal that skipped a stage still counts as having passed its gate, which
+   biases every measured rate upward. Sizing on the raw figure risks the one
+   outcome worth avoiding: a team that hits every target in this app and still
+   misses the activation goal. Sized this way, if conversion turns out to be the
+   full 12.6%, the book delivers $4.3M a month rather than $4.0M. Overshoot, not
+   shortfall.
+
+   Over half of every dollar entering Discovery dies there. That single gate
+   loses more than the other four combined.
+
+   DWELL is a budget, not a measurement. The measured figures cannot be trusted
+   in absolute terms: they come from weekly snapshots, so a deal lingering for
+   months contributes many rows and drags the median up. The budget below spends
+   the 12-week outcome rule across the four selling stages, and leaves
+   Implementation at its observed figure.
+
+   HOLDINGS follow from throughput: what sits in a stage is the volume flowing
+   through it times how long it sits there. Verified by simulation as well as by
+   formula.
+
+   THE BINDING CONSTRAINT is the top of the funnel, not the book. Sustaining
+   this needs $35.3M of new Discovery per rep per month, which is $8.15M a week.
+   The team is currently asked for $6M a week; that supports roughly $2.9M of
+   activation, not $4M.
    --------------------------------------------------------------------------- */
-const PER_REP_TARGET = 90e6;         // total pipeline one rep carries
-const ACTIVATION_PER_MONTH = 4e6;    // what the business asks each rep to activate
+const PER_REP_TARGET = 51.5e6;       // sum of the stage targets below
+const ACTIVATION_PER_MONTH = 4e6;    // GPV each rep must get live every month
+const NEW_PIPELINE_PER_WEEK = 8.15e6; // new Discovery GPV needed to sustain it
 
+/* conv = measured GPV-weighted gate, less the 10% haircut explained above */
 const STAGE_MODEL = [
-  { id: "st_discovery",      name: "Discovery",         floor: 56e6, dwellDays: 45, conv: 0.35 },
-  { id: "st_evaluation",     name: "Evaluation",        floor: 13e6, dwellDays: 30, conv: 0.45 },
-  { id: "st_negotiation",    name: "Negotiation",       floor: 6e6,  dwellDays: 30, conv: 0.65 },
-  { id: "st_closeplan",      name: "Mutual close plan", floor: 3e6,  dwellDays: 21, conv: 0.85 },
-  { id: "st_implementation", name: "Implementation",    floor: 12e6, dwellDays: 90, conv: 0.95 }
+  { id: "st_discovery",      name: "Discovery",         floor: 24.72e6, dwellDays: 21, conv: 0.4269, measuredConv: 0.436 },
+  { id: "st_evaluation",     name: "Evaluation",        floor: 9.55e6,  dwellDays: 19, conv: 0.6090, measuredConv: 0.622 },
+  { id: "st_negotiation",    name: "Negotiation",       floor: 7.96e6,  dwellDays: 26, conv: 0.6296, measuredConv: 0.643 },
+  { id: "st_closeplan",      name: "Mutual close plan", floor: 3.47e6,  dwellDays: 18, conv: 0.8362, measuredConv: 0.854 },
+  { id: "st_implementation", name: "Implementation",    floor: 5.80e6,  dwellDays: 36, conv: 0.8274, measuredConv: 0.845 }
 ];
+
+/* What the measured cycle actually was, kept so the budget has something to be
+   read against in Settings. */
+const MEASURED_DWELL = { st_discovery: 42, st_evaluation: 38, st_negotiation: 54, st_closeplan: 33, st_implementation: 36 };
 
 function defaultStages() {
   return STAGE_MODEL.map((s) => Object.assign({ inCoverage: true }, s));
 }
-
-const WEEKS_PER_MONTH = 13 / 3;      // 4.333
 
 /* Required monthly flow into each stage, working back from the activation
    target. Also the basis for how much must leave the stage before it. */
@@ -210,15 +245,28 @@ function modelFlows() {
   return out;
 }
 
-/* What must LEAVE a stage each week. Holding a target is only half the job:
-   a full stage that never empties is a blockage, not a healthy book. What has
-   to leave stage N is exactly what has to enter stage N+1; out of the last
-   stage, it is the activation target itself. */
+const WEEKS_PER_MONTH = 13 / 3;      // 4.333
+
+/* What must LEAVE a stage each week. Holding a target is only half the job: a
+   full stage that never empties is a blockage, not a healthy book. What has to
+   leave stage N is exactly what has to enter stage N+1; out of the last stage,
+   it is the activation target itself. */
 function weeklyOutflowNeed(idx) {
   const flows = modelFlows();
   const monthly = idx < STAGE_MODEL.length - 1 ? flows[idx + 1] : ACTIVATION_PER_MONTH;
   return monthly / WEEKS_PER_MONTH;
 }
+
+/* How a rep's measured dwell reads against the budget for that stage. */
+function dwellVerdict(stage, days) {
+  const budget = Number(stage.dwellDays) || 0;
+  if (!(days > 0) || !(budget > 0)) return null;
+  if (days <= budget) return { tone: "good", text: "on pace" };
+  const over = Math.round(days - budget);
+  if (days <= budget * 1.25) return { tone: "warn", text: over + "d over" };
+  return { tone: "bad", text: over + "d over" };
+}
+
 function defaultReps() {
   return [
     { id: "rep_david", name: "David Agadzhanyan", active: true },
@@ -305,7 +353,7 @@ function migrate(raw) {
     fromStage: c.fromStage === "new" ? "" : (c.fromStage || ""),
     toStage: c.toStage || "",
     weekOf: c.weekOf || thisMonday(),
-    status: c.status === "moved" || c.status === "missed" ? c.status : "open",
+    status: (c.status === "moved" || c.status === "missed" || c.status === "dead") ? c.status : "open",
     resolvedWeek: c.resolvedWeek || null,
     createdAt: c.createdAt || Date.now() - 1000 * i
   }));
@@ -413,7 +461,9 @@ function stageFlow(d, repId, idx) {
     gap, required, shortfall,
     outNeed, outShort, holdOk, lightBy, hole,
     monthsOfStock: outNeed > 0 ? cell.gpv / (outNeed * WEEKS_PER_MONTH) : 0,
-    isShort: state === "light" || state === "empty",
+    /* needsWork drives which stage the rep tab opens on: anything with an
+       action this week, or a hole worth talking about. */
+    needsWork: state !== "ok" || hole,
     isStuck: state === "move",
     state
   };
@@ -489,6 +539,95 @@ function impactHorizon(idx) {
     months: days / 30.4,
     label: MONTHS[when.getMonth()] + " " + when.getFullYear()
   };
+}
+
+/* ------------------------------------------------- new pipeline, inferred */
+
+/* The app never asks how much new pipeline was built, but it can work it out.
+   Discovery only changes for three reasons, so the identity closes:
+
+     new in  =  (Discovery now - Discovery at the capture)  +  moved out  +  killed
+
+   It is an estimate, not a measurement. It understates when a deal leaves
+   Discovery without having been named as a commit, and overstates when an
+   existing opportunity is simply revalued upward. The components are shown
+   alongside the total so the number can be argued with rather than trusted. */
+function newPipelineEstimate(d, repIds, mondayIso) {
+  const stages = d.config.stages;
+  if (!stages.length) return null;
+  const first = stages[0];
+  const base = pickBaseline(d.snapshots, mondayIso);
+  if (!base) return null;
+
+  const now = aggregate(d.current, repIds, stages).byStage[first.id].gpv;
+  const then = aggregate(base.reps, repIds, stages).byStage[first.id].gpv;
+
+  const resolvedSince = (status) => d.commits
+    .filter((c) => c.status === status && c.fromStage === first.id &&
+      repIds.indexOf(c.repId) >= 0 && c.resolvedWeek && c.resolvedWeek >= base.weekOf)
+    .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
+
+  const movedOut = resolvedSince("moved");
+  const killed = resolvedSince("dead");
+  const added = (now - then) + movedOut + killed;
+  const need = NEW_PIPELINE_PER_WEEK * (repIds.length || 1);
+
+  return {
+    added, delta: now - then, movedOut, killed, now, then,
+    need, since: base.weekOf,
+    tone: added >= need ? "good" : (added >= need * 0.8 ? "warn" : "bad")
+  };
+}
+
+/* ------------------------------------------------------------- scorecard */
+
+/* Everything the model asks for, in one table, each line as now-versus-goal.
+   Deliberately only contains things this app can actually measure. Stage
+   conversion is not among them: measuring it needs cohorts followed over
+   months, which lives in Salesforce, so the rates are shown in Settings as
+   inputs rather than pretended to be tracked here. */
+function scorecard(d, repIds, mondayIso) {
+  const n = repIds.length || 1;
+  const stages = d.config.stages;
+  const cur = aggregate(d.current, repIds, stages);
+  const cover = coverOf(d, repIds);
+  const tgt = targetCover();
+  const flow = flowOf(d, repIds, mondayIso);
+  const pipe = newPipelineEstimate(d, repIds, mondayIso);
+  const base = pickBaseline(d.snapshots, mondayIso);
+  const last = stages.length ? stages[stages.length - 1] : null;
+
+  /* activated = deals that left the final stage since the capture */
+  const activated = last && base ? d.commits
+    .filter((c) => c.status === "moved" && c.fromStage === last.id &&
+      repIds.indexOf(c.repId) >= 0 && c.resolvedWeek && c.resolvedWeek >= base.weekOf)
+    .reduce((a, c) => a + (Number(c.gpv) || 0), 0) : 0;
+  const activationGoal = (ACTIVATION_PER_MONTH * n) / WEEKS_PER_MONTH;
+
+  /* Scale the floor to whoever is being scored: the whole team on Master, one
+     person on their own tab. teamFloor would judge a single rep against all
+     seven reps' target. */
+  const onTarget = stages.filter((st) => cur.byStage[st.id].gpv >= (Number(st.floor) || 0) * n).length;
+
+  const row = (label, now, goal, fmt, note) => ({
+    label, now, goal, note,
+    text: fmt(now), goalText: fmt(goal),
+    pct: goal > 0 ? (now / goal) * 100 : 0,
+    tone: tone(now, goal)
+  });
+  const money = (v) => fmtMoney(v);
+  const months = (v) => (Math.round(v * 10) / 10) + " months";
+  const count = (v) => String(Math.round(v));
+
+  return [
+    row("Pipeline held", cur.total, PER_REP_TARGET * n, money, "across all five stages"),
+    row("New pipeline built", pipe ? pipe.added : 0, NEW_PIPELINE_PER_WEEK * n, money,
+        pipe ? "since " + shortDate(pipe.since) : "no capture to compare against"),
+    row("Moving up a stage", flow.named, flow.need, money, "named this week"),
+    row("Activated", activated, activationGoal, money, "left the final stage this week"),
+    row("Runway", cover.months, tgt.months, months, "how long the book lasts"),
+    row("Stages on target", onTarget, stages.length, count, "team GPV at or above the floor")
+  ];
 }
 
 /* --------------------------------------------------------- days trends */
@@ -692,6 +831,63 @@ function CoverWorking({ data, repIds }) {
   );
 }
 
+/* The app never holds account names, so it cannot say which deals to move.
+   It can say how much, and out of which stage, which is the actionable half. */
+function MoveWorking({ data, repIds, monday }) {
+  const stages = data.config.stages;
+  const rows = stages.map((st, i) => {
+    const need = weeklyOutflowNeed(i) * (repIds.length || 1);
+    const named = data.commits
+      .filter((c) => c.status === "open" && c.fromStage === st.id && repIds.indexOf(c.repId) >= 0)
+      .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
+    return { name: st.name, need, named, short: Math.max(0, need - named) };
+  });
+  return (
+    <div className="calc">
+      {rows.map((r) => (
+        <span key={r.name} className={"calc-part" + (r.short > 0 ? " gap" : " met")}>
+          <b>{r.name.split(" ")[0]}</b>{" "}
+          {r.short > 0 ? "name " + fmtMoney(r.short) + " more" : fmtMoney(r.named) + " named"}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function Scorecard({ rows, caption }) {
+  return (
+    <table className="tbl score">
+      <thead>
+        <tr>
+          <th>{caption || "Measure"}</th>
+          <th className="r nar">Now</th>
+          <th className="r nar">Goal</th>
+          <th className="prog">Progress</th>
+          <th className="r nar">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.label}>
+            <td>
+              <div className="score-label">{r.label}</div>
+              <div className="score-note">{r.note}</div>
+            </td>
+            <td className="r nar strong">{r.text}</td>
+            <td className="r nar muted">{r.goalText}</td>
+            <td className="prog">
+              <span className="repbar">
+                <span className={r.tone} style={{ width: Math.max(0, Math.min(100, r.pct)).toFixed(1) + "%" }} />
+              </span>
+            </td>
+            <td className="r nar"><Pill tone={r.tone}>{Math.round(r.pct)}%</Pill></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function Spark({ points }) {
   const v = (points || []).filter((p) => isFinite(p));
   if (v.length < 2) return null;
@@ -763,6 +959,14 @@ function buildFocus(d, monday) {
     /* Direction of travel beats an absolute number: a stage getting slower
        over a month is worth raising whatever the headline figure is. */
     d.config.stages.forEach((st) => {
+      const c = cellOf(d.current, r.id, st.id);
+      const v = dwellVerdict(st, c.avgDays);
+      if (v && v.tone === "bad") {
+        extras.push({
+          k: "warn", rep: r,
+          text: <><b>{st.name}</b> is running <em>{Math.round(c.avgDays)} days</em> against a {st.dwellDays}-day budget</>
+        });
+      }
       const t = daysTrends(d, [r.id], st.id, monday).filter((x) => x.ok && x.weeks === 4)[0];
       if (t && t.pct >= 15) {
         extras.push({
@@ -787,11 +991,8 @@ function MasterView({ ctx }) {
   const coverPct = tgt.months > 0 ? (cover.months / tgt.months) * 100 : 0;
   const coverTone = tone(cover.months, tgt.months);
   const flow = flowOf(data, ids, monday);
-  const flowTone = tone(flow.named, flow.need);
-  const discNeed = weeklyOutflowNeed(0) * ids.length;
-  const discNamed = data.commits
-    .filter((c) => c.status === "open" && c.fromStage === stages[0].id && ids.indexOf(c.repId) >= 0)
-    .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
+  const newPipe = newPipelineEstimate(data, ids, monday);
+  const card = scorecard(data, ids, monday);
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -805,82 +1006,42 @@ function MasterView({ ctx }) {
 
   return (
     <>
+      <div className="section" style={{ marginTop: "18px" }}>
+        <div className="section-h">
+          <h2>Where we are against goal</h2>
+          <span className="hint">everything the model asks for, in one place</span>
+        </div>
+        <Scorecard rows={card} />
+        <p className="faint" style={{ fontSize: "12.5px", marginTop: "12px", fontWeight: 600 }}>
+          Green at or above goal, amber from 80%, red below. Stage conversion is not on this list because it
+          cannot be measured here &mdash; it needs deals followed over months in Salesforce. The rates the
+          model runs on are in Settings.
+        </p>
+      </div>
+
       <div className="headline">
         <div className="headline-row">
           <Gauge pct={Math.min(coverPct, 999)} tone={coverTone} />
-          <div>
-            <div className="hero-k">How long the book lasts</div>
+          <div style={{ maxWidth: "560px" }}>
+            <div className="hero-k">Pipeline runway</div>
             <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "22px", fontWeight: 700 }}>months</span></div>
             <div className="hero-s">
-              If no new deal ever came in, what the team is already working would keep activation at{" "}
-              <b>{fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month</b> for {cover.months.toFixed(1)} months.
-              A full book lasts <b>{tgt.months.toFixed(1)}</b>.
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
-                {fmtMoney(cover.total)} expected to activate across all five stages, against{" "}
-                {fmtMoney(tgtOne.total * ids.length)} for a full book
-              </div>
+              At {fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month, everything the team is working today
+              covers <b>{cover.months.toFixed(1)} months</b> of activation before it runs dry.
+              A healthy book covers <b>{tgt.months.toFixed(1)}</b>.
               <CoverWorking data={data} repIds={ids} />
             </div>
           </div>
-          <div className="minis">
-            <div className="mini">
-              <div className="mini-k">Already won</div>
-              <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
-              <div className="mini-s">signed, waiting to go live &middot; target {tgt.monthsLocked.toFixed(1)}m</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Still to win</div>
-              <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
-              <div className="mini-s">still has to be sold &middot; target {tgt.monthsSelling.toFixed(1)}m</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Since Monday</div>
-              <div className="mini-v">{base ? fmtSignedMoney(cur.total - base.total) : "\u2014"}</div>
-              <div className="mini-s">{baseline ? "vs " + shortDate(baseline.weekOf) : "no baseline"}</div>
-            </div>
+        </div>
+        {newPipe ? (
+          <div className="calc" style={{ marginTop: "16px", maxWidth: "none" }}>
+            <span className="calc-part"><b>Discovery now</b> {fmtMoney(newPipe.now)}</span>
+            <span className="calc-part"><b>was</b> {fmtMoney(newPipe.then)}</span>
+            <span className="calc-part"><b>moved on</b> {fmtMoney(newPipe.movedOut)}</span>
+            <span className="calc-part"><b>killed</b> {fmtMoney(newPipe.killed)}</span>
+            <span className="calc-total">so {fmtMoney(newPipe.added)} of new pipeline built</span>
           </div>
-        </div>
-        <div className="track">
-          <div className={"track-fill " + coverTone} style={{ width: Math.min(100, coverPct).toFixed(1) + "%" }} />
-          <div className="track-tick" style={{ left: "100%" }} />
-        </div>
-        <div className="track-labels">
-          <span>0</span>
-          <span>{tgt.months.toFixed(1)} months = a full book</span>
-        </div>
-      </div>
-
-      <div className="headline" style={{ marginTop: "14px" }}>
-        <div className="headline-row">
-          <Gauge pct={Math.min(flow.pct, 999)} tone={flowTone} />
-          <div>
-            <div className="hero-k">Deals named to move this week</div>
-            <div className="hero-v">{fmtMoney(flow.named)}</div>
-            <div className="hero-s">
-              of the <b>{fmtMoney(flow.need)}</b> that should move up a stage this week
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
-                the book above only refills if this one gets hit
-              </div>
-            </div>
-          </div>
-          <div className="minis">
-            <div className="mini">
-              <div className="mini-k">Out of Discovery</div>
-              <div className="mini-v">{fmtMoney(discNamed)}</div>
-              <div className="mini-s">of {fmtMoney(discNeed)} needed</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Open commits</div>
-              <div className="mini-v">{team.open.length}</div>
-              <div className="mini-s">{fmtMoney(team.openGpv)} in play</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Team hit rate</div>
-              <div className="mini-v">{team.hitRate === null ? "\u2014" : Math.round(team.hitRate * 100) + "%"}</div>
-              <div className="mini-s">{team.moved} moved, {team.missed} missed</div>
-            </div>
-          </div>
-        </div>
+        ) : null}
       </div>
 
       <div className="section">
@@ -901,7 +1062,13 @@ function MasterView({ ctx }) {
       </div>
 
       <div className="section">
-        <div className="section-h"><h2>The funnel</h2><span className="hint">bar is what is held, the pill is what is moving out this week</span></div>
+        <div className="section-h">
+          <h2>The funnel</h2>
+          <span className="hint">bar is what is held, the pill is what is moving out this week</span>
+        </div>
+        <div style={{ marginBottom: "16px" }}>
+          <MoveWorking data={data} repIds={ids} monday={monday} />
+        </div>
         <div className="fun-head">
           <div>Stage</div><div />
           <div style={{ textAlign: "right" }}>GPV</div>
@@ -940,6 +1107,7 @@ function MasterView({ ctx }) {
               </div>
               <div className="fun-days">
                 {fmtDays(a.avgDays)}
+                <span className="faint" style={{ fontSize: "11.5px", fontWeight: 700 }}> / {st.dwellDays}d</span>
                 <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}>
                   <DaysTrend trends={daysTrends(data, ids, st.id, monday)} compact />
                 </div>
@@ -958,7 +1126,7 @@ function MasterView({ ctx }) {
 
       <div className="section">
         <div className="section-h">
-          <h2>The team</h2><span className="hint">how many months each book would last with nothing new added &mdash; a full one lasts {tgt.months.toFixed(1)}</span>
+          <h2>The team</h2><span className="hint">runway is months of activation covered &mdash; a healthy book covers {tgt.months.toFixed(1)}</span>
           <span className="spacer" />
           <button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>
         </div>
@@ -966,10 +1134,8 @@ function MasterView({ ctx }) {
           <thead>
             <tr>
               <th>Rep</th>
-              <th className="r nar">Book lasts</th>
-              <th className="r nar">Already won</th>
-              <th className="r nar">Still to win</th>
-              <th className="r nar">Named to move</th>
+              <th className="r nar">Runway</th>
+              <th className="r nar">GPV moving this week</th>
               <th className="r nar">Thin stages</th>
               <th className="r nar">Hit rate</th>
             </tr>
@@ -994,9 +1160,7 @@ function MasterView({ ctx }) {
                       </span>
                     </div>
                   </td>
-                  <td className="r nar strong">{cv.months.toFixed(1)}m</td>
-                  <td className="r nar muted">{cv.monthsLocked.toFixed(1)}m</td>
-                  <td className="r nar muted">{cv.monthsSelling.toFixed(1)}m</td>
+                  <td className="r nar strong">{cv.months.toFixed(1)} mo</td>
                   <td className="r nar">
                     <Pill tone={fl.named >= fl.need ? "good" : (fl.named > 0 ? "warn" : "bad")}>
                       {fmtMoney(fl.named)} of {fmtMoney(fl.need)}
@@ -1074,6 +1238,8 @@ function CommitRow({ commit, stages, actions, onEditing, monday }) {
       <span className="acts">
         <button className="btn ok" onClick={() => actions.resolveCommit(commit.id, "moved")}>Moved</button>
         <button className="btn no" onClick={() => actions.resolveCommit(commit.id, "missed")}>Missed</button>
+        <button className="btn kill" title="Disqualified: out of the funnel for good"
+          onClick={() => actions.resolveCommit(commit.id, "dead")}>Dead</button>
         <button className="btn x" title="Delete" onClick={() => actions.deleteCommit(commit.id)}>×</button>
       </span>
     </div>
@@ -1089,14 +1255,14 @@ function RepView({ ctx, rep }) {
   const mb = baseline ? aggregate(baseline.reps, [rep.id], stages) : null;
   const st = commitStats(data.commits, rep.id, monday);
 
-  const cover = coverOf(data, [rep.id]);
-  const tgt = targetCover();
   const flow = flowOf(data, [rep.id], monday);
+  const repPipe = newPipelineEstimate(data, [rep.id], monday);
+  const card = scorecard(data, [rep.id], monday);
 
   /* Open on the first stage that needs work, until the user picks another. */
   let firstShort = stages.length ? stages[0].id : null;
   for (let i = 0; i < stages.length; i++) {
-    if (stageFlow(data, rep.id, i).isShort) { firstShort = stages[i].id; break; }
+    if (stageFlow(data, rep.id, i).needsWork) { firstShort = stages[i].id; break; }
   }
   const activeStage = openStage === undefined || openStage === null ? firstShort : (openStage === "__none__" ? null : openStage);
 
@@ -1110,43 +1276,35 @@ function RepView({ ctx, rep }) {
 
   return (
     <>
-      <div className="headline">
-        <div className="headline-row">
-          <div>
-            <div className="hero-k">{rep.name}</div>
-            <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "20px", fontWeight: 700 }}>months</span></div>
-            <div className="hero-s">
-              Their book would keep {fmtMoney(ACTIVATION_PER_MONTH)} a month running for{" "}
-              {cover.months.toFixed(1)} months with nothing new added. A full book lasts <b>{tgt.months.toFixed(1)}</b>.
-              <div className="faint" style={{ fontSize: "12.5px", marginTop: "4px", fontWeight: 600 }}>
-                {fmtMoney(mine.total)} of pipeline across all five stages, of which{" "}
-                {fmtMoney(cover.total)} is expected to activate eventually
-              </div>
-              <CoverWorking data={data} repIds={[rep.id]} />
-            </div>
-          </div>
-          <div className="minis">
-            <div className="mini">
-              <div className="mini-k">Already won</div>
-              <div className="mini-v">{cover.monthsLocked.toFixed(1)}m</div>
-              <div className="mini-s">signed, going live &middot; target {tgt.monthsLocked.toFixed(1)}m</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Still to win</div>
-              <div className="mini-v">{cover.monthsSelling.toFixed(1)}m</div>
-              <div className="mini-s">still to be sold &middot; target {tgt.monthsSelling.toFixed(1)}m</div>
-            </div>
-            <div className="mini">
-              <div className="mini-k">Named to move</div>
-              <div className="mini-v">{fmtMoney(flow.named)}</div>
-              <div className="mini-s">of {fmtMoney(flow.need)} this week</div>
-            </div>
-          </div>
+      <div className="section" style={{ marginTop: "18px" }}>
+        <div className="section-h">
+          <h2>{rep.name} against goal</h2>
+          <span className="hint">the same measures as the team view, scored for one book</span>
         </div>
+        <Scorecard rows={card} />
+        <div style={{ marginTop: "14px" }}>
+          <CoverWorking data={data} repIds={[rep.id]} />
+        </div>
+        {repPipe ? (
+          <p className="faint" style={{ fontSize: "12.5px", marginTop: "10px", fontWeight: 600 }}>
+            New pipeline worked out from Discovery: {fmtMoney(repPipe.now)} there now, {fmtMoney(repPipe.then)} on{" "}
+            {shortDate(repPipe.since)}, {fmtMoney(repPipe.movedOut)} moved on, {fmtMoney(repPipe.killed)} killed.
+          </p>
+        ) : null}
       </div>
 
       <div className="section">
-        <div className="section-h"><h2>Walk the funnel</h2><span className="hint">open a stage to work it</span></div>
+        <div className="section-h">
+          <h2>Walk the funnel</h2>
+          <span className="hint">
+            {flow.need - flow.named > 0
+              ? fmtMoney(flow.need - flow.named) + " of movement still to name this week"
+              : "movement for the week is fully named"}
+          </span>
+        </div>
+        <div style={{ marginBottom: "14px" }}>
+          <MoveWorking data={data} repIds={[rep.id]} monday={monday} />
+        </div>
         <div className="walk">
           {stages.map((s, i) => {
             const f = stageFlow(data, rep.id, i);
@@ -1193,7 +1351,7 @@ function RepView({ ctx, rep }) {
                       {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} out
                     </span>
                     <span className="st-sub">
-                      {fmtDays(f.avgDays)} in stage
+                      {fmtDays(f.avgDays)} of {s.dwellDays}d
                       {(() => {
                         const t = daysTrends(data, [rep.id], s.id, monday).filter((x) => x.ok)[0];
                         if (!t || Math.abs(t.pct) < 1) return "";
@@ -1210,6 +1368,14 @@ function RepView({ ctx, rep }) {
                 {isOpen ? (
                   <div className="st-body">
                     <p className={"st-lead " + f.state}>{lead}</p>
+                    {i === 0 && repPipe ? (
+                      <p className="st-risk" style={{ background: "var(--paper)", color: "var(--ink-2)" }}>
+                        <b>{fmtMoney(repPipe.added)}</b> of new pipeline built since {shortDate(repPipe.since)},
+                        against {fmtMoney(repPipe.need)} needed.
+                        {" "}Worked out from this stage: {fmtMoney(repPipe.now)} here now, {fmtMoney(repPipe.then)} before,
+                        {" "}{fmtMoney(repPipe.movedOut)} moved on and {fmtMoney(repPipe.killed)} killed.
+                      </p>
+                    ) : null}
                     {f.hole ? (
                       <p className="st-risk">
                         <b>{fmtMoney(f.lightBy)} light</b> here, holding {fmtMoney(f.gpv)} of {fmtMoney(f.target)}.
@@ -1230,6 +1396,13 @@ function RepView({ ctx, rep }) {
                       <span className="st-f">
                         <label>median days in stage</label>
                         <DaysInput value={f.avgDays} onEditing={onEditing} onCommit={(v) => actions.setCell(rep.id, s.id, "avgDays", v)} />
+                        <span className="faint" style={{ fontSize: "12px", fontWeight: 700 }}>budget {s.dwellDays}d</span>
+                        {dwellVerdict(s, f.avgDays) ? (
+                          <Pill tone={dwellVerdict(s, f.avgDays).tone}>{dwellVerdict(s, f.avgDays).text}</Pill>
+                        ) : null}
+                      </span>
+                      <span className="st-f">
+                        <label>trend</label>
                         <DaysTrend trends={daysTrends(data, [rep.id], s.id, monday)} />
                       </span>
                       <span className="st-f">
@@ -1281,7 +1454,7 @@ function RepView({ ctx, rep }) {
         <div className="section">
           <div className="section-h">
             <h2>Track record</h2>
-            <span className="hint">{st.moved} moved, {st.missed} missed</span>
+            <span className="hint">{st.moved} moved, {st.missed} missed, {st.dead} disqualified</span>
             <span className="spacer" />
             <button className="btn txt" onClick={() => setShowHist(!showHist)}>{showHist ? "Hide" : "Show all " + resolved.length}</button>
           </div>
@@ -1344,18 +1517,37 @@ function SettingsView({ ctx }) {
           <span className="hint">fixed targets, sized from the activation goal &mdash; nothing here is editable</span>
         </div>
         <p className="muted" style={{ marginTop: 0, maxWidth: "740px", fontSize: "14px" }}>
-          Every rep carries <b>{fmtMoney(PER_REP_TARGET)}</b> of pipeline. That is not a round number
-          someone picked: it is what has to sit in the book to activate <b>{fmtMoney(ACTIVATION_PER_MONTH)} a
-          month</b>, given how long deals linger in each stage and how many survive it. Start at
-          activation, divide back through each conversion rate to get the volume that must enter a
-          stage, then multiply by the time it spends there.
+          Every rep carries <b>{fmtMoney(PER_REP_TARGET)}</b> of pipeline. It is not a round number someone
+          picked: it is what has to sit in the book to get <b>{fmtMoney(ACTIVATION_PER_MONTH)} a month</b> live,
+          given how many deals survive each stage and how long they sit there.
+        </p>
+        <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
+          Conversion is measured from 19,720 closed US field opportunities and weighted by GPV rather than
+          by opportunity count. That distinction matters: by count the org converts 16.4% out of Discovery,
+          by GPV only <b>12.6%</b>, because large deals convert several points worse through the commercial
+          gates. Holding the team to the count figure would flatter the funnel by a third.
+        </p>
+        <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
+          Dwell is a <b>budget</b>, not a measurement. The measured figures come from weekly snapshots, so a
+          deal that lingers contributes many rows and drags the median up &mdash; they are not reliable in
+          absolute terms. The budget spends the 12-week outcome rule across the four selling stages instead.
+        </p>
+        <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
+          <b>The book is the easy part.</b> Sustaining it needs {fmtMoney(modelFlows()[0])} of new Discovery
+          per rep every month, which is <b>{fmtMoney(NEW_PIPELINE_PER_WEEK)} a week</b>. That figure does not
+          improve when the cycle speeds up &mdash; only better conversion moves it. The team is currently
+          asked for $6M a week, and at 12.6% conversion that supports {fmtMoney(6e6 * WEEKS_PER_MONTH * 0.126)} of
+          activation rather than {fmtMoney(ACTIVATION_PER_MONTH)}. Closing that gap is either more pipeline
+          built, or a better Discovery gate &mdash; over half of every dollar entering Discovery dies there,
+          more than the other four stages combined.
         </p>
         <table className="tbl">
           <thead>
             <tr>
               <th>Stage</th>
-              <th className="r nar">Sits for</th>
-              <th className="r nar">Converts at</th>
+              <th className="r nar">Measured</th>
+              <th className="r nar">Budget</th>
+              <th className="r nar">Conversion used</th>
               <th className="r nar">So hold</th>
               <th className="r nar">Move out weekly</th>
               <th className="r nar">Team of {n}</th>
@@ -1365,19 +1557,21 @@ function SettingsView({ ctx }) {
             {stages.map((st, i) => (
               <tr key={st.id}>
                 <td><span className="idx">{i + 1}</span> {st.name}</td>
-                <td className="r nar muted">{st.dwellDays}d</td>
-                <td className="r nar muted">{Math.round(st.conv * 100)}%</td>
+                <td className="r nar muted">{MEASURED_DWELL[st.id] || "\u2014"}d</td>
+                <td className="r nar strong">{st.dwellDays}d</td>
+                <td className="r nar muted">{(st.conv * 100).toFixed(1)}%<span className="faint" style={{ fontSize: "11px" }}> &nbsp;measured {(st.measuredConv * 100).toFixed(1)}%</span></td>
                 <td className="r nar strong">{fmtMoney(st.floor)}</td>
                 <td className="r nar strong">{fmtMoney(weeklyOutflowNeed(i))}</td>
-                <td className="r nar muted">{fmtMoney(teamFloor(data, st))} held, {fmtMoney(weeklyOutflowNeed(i) * n)}/wk out</td>
+                <td className="r nar muted">{fmtMoney(teamFloor(data, st))} held</td>
               </tr>
             ))}
             <tr>
               <td className="strong">Per rep</td>
-              <td className="r nar muted">{stages.reduce((a, x) => a + (x.dwellDays || 0), 0)}d total</td>
+              <td className="r nar muted">{[0,1,2,3].reduce((a, i) => a + (MEASURED_DWELL[stages[i] && stages[i].id] || 0), 0)}d selling</td>
+              <td className="r nar strong">{[0,1,2,3].reduce((a, i) => a + ((stages[i] && stages[i].dwellDays) || 0), 0)}d selling</td>
               <td className="r nar muted">{(stages.reduce((a, x) => a * (x.conv || 1), 1) * 100).toFixed(1)}% overall</td>
               <td className="r nar strong">{fmtMoney(floorSum)}</td>
-              <td className="r nar" />
+              <td className="r nar strong">{fmtMoney(stages.reduce((a, x, i) => a + weeklyOutflowNeed(i), 0))}</td>
               <td className="r nar strong">{fmtMoney(stages.reduce((a, x) => a + teamFloor(data, x), 0))} held</td>
             </tr>
           </tbody>
@@ -2031,6 +2225,10 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .muted{color:var(--slate)}
 .faint{color:var(--faint)}
 .empty{padding:20px 0;color:var(--slate)}
+.score td{padding-top:14px;padding-bottom:14px}
+.score-label{font-size:14.5px;font-weight:650;letter-spacing:-.01em}
+.score-note{font-size:12px;color:var(--faint);margin-top:2px;font-weight:500}
+.tbl .prog{width:190px;min-width:120px}
 .namecell{display:flex;flex-direction:column;gap:6px;min-width:190px}
 .namecell .lnk{background:none;border:0;padding:0;font:inherit;font-size:14px;font-weight:650;color:var(--ink);cursor:pointer;text-align:left}
 .namecell .lnk:hover{color:var(--accent)}
@@ -2076,6 +2274,9 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .btn.ok:hover{background:var(--good-bg);border-color:var(--good)}
 .btn.no{color:var(--bad);border-color:#F9D3D3}
 .btn.no:hover{background:var(--bad-bg);border-color:var(--bad)}
+.btn.kill{color:var(--slate);border-color:var(--line)}
+.btn.kill:hover{background:var(--ink);border-color:var(--ink);color:#fff}
+.tag.dead{background:#EEF1F7;color:var(--slate)}
 .btn.x{border-color:transparent;color:var(--faint);padding:7px 9px}
 .btn.x:hover{background:var(--paper);color:var(--ink)}
 .btn.txt{border:0;background:none;padding:4px 2px;color:var(--accent);font-weight:700}
@@ -2135,9 +2336,14 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   background:var(--paper);border-radius:var(--r-sm);padding:14px 16px}
 .st-f{display:flex;align-items:center;gap:9px}
 .st-f label{font-size:12.5px;color:var(--slate);font-weight:600}
+.unit{font-size:13px;font-weight:700;color:var(--slate);margin-left:5px}
 .calc{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;max-width:640px}
 .calc-part{font-size:11.5px;font-weight:600;color:var(--slate);background:var(--paper);padding:3px 9px;border-radius:999px;white-space:nowrap}
 .calc-part b{font-weight:800;color:var(--ink-2)}
+.calc-part.gap{background:var(--warn-bg);color:var(--warn)}
+.calc-part.gap b{color:var(--warn)}
+.calc-part.met{background:var(--good-bg);color:var(--good)}
+.calc-part.met b{color:var(--good)}
 .calc-total{font-size:11.5px;font-weight:800;color:var(--ink);background:var(--accent-bg);padding:3px 10px;border-radius:999px;white-space:nowrap}
 .st-risk{font-size:13px;color:var(--warn);background:var(--warn-bg);padding:9px 13px;border-radius:var(--r-sm);margin:0 0 16px;max-width:660px;font-weight:500}
 .st-risk b{font-weight:800}
