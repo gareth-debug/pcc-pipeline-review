@@ -559,23 +559,39 @@ function newPipelineEstimate(d, repIds, mondayIso) {
   const base = pickBaseline(d.snapshots, mondayIso);
   if (!base) return null;
 
-  const now = aggregate(d.current, repIds, stages).byStage[first.id].gpv;
-  const then = aggregate(base.reps, repIds, stages).byStage[first.id].gpv;
+  /* A rep whose whole book was empty at the capture has no before-and-after:
+     their first entry is data catching up, not pipeline created. Counting it
+     would report the whole book as one week's build. Such reps are left out
+     until they have a capture with something in it, and the goal shrinks to
+     match so the percentage stays honest. */
+  const counted = repIds.filter((rid) =>
+    stages.some((st) => cellOf(base.reps, rid, st.id).gpv > 0));
+  const skipped = repIds.length - counted.length;
+
+  if (!counted.length) {
+    return {
+      added: 0, delta: 0, movedOut: 0, killed: 0, now: 0, then: 0,
+      need: 0, since: base.weekOf, counted: 0, skipped, unavailable: true, tone: "flat"
+    };
+  }
+
+  const now = aggregate(d.current, counted, stages).byStage[first.id].gpv;
+  const then = aggregate(base.reps, counted, stages).byStage[first.id].gpv;
 
   const resolvedSince = (status) => d.commits
     .filter((c) => c.status === status && c.fromStage === first.id &&
-      repIds.indexOf(c.repId) >= 0 && c.resolvedWeek && c.resolvedWeek >= base.weekOf)
+      counted.indexOf(c.repId) >= 0 && c.resolvedWeek && c.resolvedWeek >= base.weekOf)
     .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
 
   const movedOut = resolvedSince("moved");
   const killed = resolvedSince("dead");
   const added = (now - then) + movedOut + killed;
-  const need = NEW_PIPELINE_PER_WEEK * (repIds.length || 1);
+  const need = NEW_PIPELINE_PER_WEEK * counted.length;
 
   return {
     added, delta: now - then, movedOut, killed, now, then,
-    need, since: base.weekOf,
-    tone: added >= need ? "good" : (added >= need * 0.8 ? "warn" : "bad")
+    need, since: base.weekOf, counted: counted.length, skipped, unavailable: false,
+    tone: tone(added, need)
   };
 }
 
@@ -609,6 +625,15 @@ function scorecard(d, repIds, mondayIso) {
      seven reps' target. */
   const onTarget = stages.filter((st) => cur.byStage[st.id].gpv >= (Number(st.floor) || 0) * n).length;
 
+  /* The book target is only valid at the budgeted speed. Holding enough while
+     running slow produces the worst outcome available: every GPV number green
+     and the activation goal still missed. So speed gets its own line. */
+  const measurable = stages.filter((st) => cur.byStage[st.id].avgDays > 0);
+  const atPace = measurable.filter((st) => {
+    const v = dwellVerdict(st, cur.byStage[st.id].avgDays);
+    return v && v.tone === "good";
+  }).length;
+
   const row = (label, now, goal, fmt, note) => ({
     label, now, goal, note,
     text: fmt(now), goalText: fmt(goal),
@@ -619,15 +644,32 @@ function scorecard(d, repIds, mondayIso) {
   const months = (v) => (Math.round(v * 10) / 10) + " months";
   const count = (v) => String(Math.round(v));
 
-  return [
+  const reporting = repIds.filter((rid) =>
+    stages.some((st) => cellOf(d.current, rid, st.id).gpv > 0)).length;
+
+  const rows = [
     row("Pipeline held", cur.total, PER_REP_TARGET * n, money, "across all five stages"),
-    row("New pipeline built", pipe ? pipe.added : 0, NEW_PIPELINE_PER_WEEK * n, money,
-        pipe ? "since " + shortDate(pipe.since) : "no capture to compare against"),
+    row("New pipeline built",
+        pipe && !pipe.unavailable ? pipe.added : 0,
+        pipe && !pipe.unavailable ? pipe.need : NEW_PIPELINE_PER_WEEK * n,
+        money,
+        !pipe ? "no capture to compare against"
+          : pipe.unavailable ? "needs a capture with numbers in it, so not measurable yet"
+          : "since " + shortDate(pipe.since) + (pipe.skipped > 0
+              ? " \u00b7 " + pipe.skipped + " rep" + (pipe.skipped === 1 ? "" : "s") + " left out, first week of data"
+              : "")),
     row("Moving up a stage", flow.named, flow.need, money, "named this week"),
     row("Activated", activated, activationGoal, money, "left the final stage this week"),
     row("Runway", cover.months, tgt.months, months, "how long the book lasts"),
-    row("Stages on target", onTarget, stages.length, count, "team GPV at or above the floor")
+    row("Stages on target", onTarget, stages.length, count, "GPV at or above the floor"),
+    row("Stages at pace", atPace, measurable.length || stages.length, count,
+        measurable.length
+          ? "within the dwell budget \u2014 the book target assumes this"
+          : "no days entered, so pace cannot be confirmed")
   ];
+  rows.reporting = reporting;
+  rows.of = n;
+  return rows;
 }
 
 /* --------------------------------------------------------- days trends */
@@ -855,7 +897,15 @@ function MoveWorking({ data, repIds, monday }) {
 }
 
 function Scorecard({ rows, caption }) {
+  const partial = rows.of > 1 && rows.reporting < rows.of;
   return (
+    <>
+      {partial ? (
+        <p className="st-risk" style={{ marginBottom: "14px" }}>
+          Only <b>{rows.reporting} of {rows.of}</b> reps have numbers in. Everything below counts the
+          missing ones as zero, so the team is being read low until they fill in.
+        </p>
+      ) : null}
     <table className="tbl score">
       <thead>
         <tr>
@@ -885,6 +935,7 @@ function Scorecard({ rows, caption }) {
         ))}
       </tbody>
     </table>
+    </>
   );
 }
 
@@ -1107,7 +1158,11 @@ function MasterView({ ctx }) {
               </div>
               <div className="fun-days">
                 {fmtDays(a.avgDays)}
-                <span className="faint" style={{ fontSize: "11.5px", fontWeight: 700 }}> / {st.dwellDays}d</span>
+                <div className="faint" style={{ fontSize: "11.5px", fontWeight: 700, marginTop: "2px" }}>
+                  {a.avgDays > 0 && dwellVerdict(st, a.avgDays)
+                    ? dwellVerdict(st, a.avgDays).text
+                    : "budget " + st.dwellDays + "d"}
+                </div>
                 <div style={{ marginTop: "4px", display: "flex", justifyContent: "flex-end" }}>
                   <DaysTrend trends={daysTrends(data, ids, st.id, monday)} compact />
                 </div>
@@ -1351,7 +1406,11 @@ function RepView({ ctx, rep }) {
                       {fmtMoney(f.pledgedOut)} of {fmtMoney(f.outNeed)} out
                     </span>
                     <span className="st-sub">
-                      {fmtDays(f.avgDays)} of {s.dwellDays}d
+                      {f.avgDays > 0
+                        ? fmtDays(f.avgDays) + " \u00b7 " + (dwellVerdict(s, f.avgDays)
+                            ? dwellVerdict(s, f.avgDays).text
+                            : "budget " + s.dwellDays + "d")
+                        : "no days entered \u00b7 budget " + s.dwellDays + "d"}
                       {(() => {
                         const t = daysTrends(data, [rep.id], s.id, monday).filter((x) => x.ok)[0];
                         if (!t || Math.abs(t.pct) < 1) return "";
@@ -1531,6 +1590,14 @@ function SettingsView({ ctx }) {
           Dwell is a <b>budget</b>, not a measurement. The measured figures come from weekly snapshots, so a
           deal that lingers contributes many rows and drags the median up &mdash; they are not reliable in
           absolute terms. The budget spends the 12-week outcome rule across the four selling stages instead.
+        </p>
+        <p className="st-risk" style={{ maxWidth: "740px", marginTop: "12px" }}>
+          <b>The {fmtMoney(PER_REP_TARGET)} only holds at the budgeted speed.</b> Pipeline needed is flow times
+          how long deals sit, so a slower book needs a bigger one: at the cycle this team currently runs, the
+          same activation target would need roughly <b>$97M</b> per rep rather than {fmtMoney(PER_REP_TARGET)}.
+          Nearly three quarters of the difference between those two numbers is speed, not conversion. That is
+          why the scorecard carries a stages-at-pace line: holding enough while running slow means every GPV
+          figure reads green and the activation goal is still missed.
         </p>
         <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>The book is the easy part.</b> Sustaining it needs {fmtMoney(modelFlows()[0])} of new Discovery
