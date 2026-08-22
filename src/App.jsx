@@ -987,19 +987,20 @@ function Spark({ points }) {
   );
 }
 
-function Bar({ value, target, scale, tone: t, pledged }) {
-  const s = scale > 0 ? scale : 1;
-  const w = Math.max(0, Math.min(100, (Math.max(value, 0) / s) * 100));
-  const tx = Math.max(0, Math.min(100, (Math.max(target, 0) / s) * 100));
-  const pw = pledged ? Math.max(0, Math.min(100 - w, (pledged / s) * 100)) : 0;
+/* Always 0 to 100% of this figure's own target, so the full mark sits in the
+   same place on every row and the five stages can be compared by eye. Anything
+   past target shows a cap rather than a longer bar, because "over" is one fact,
+   not a quantity worth drawing. */
+function MiniBar({ value, target, tone: t }) {
+  const r = target > 0 ? value / target : 0;
+  const w = Math.max(0, Math.min(1, r)) * 100;
   return (
-    <span className="st-bar">
-      <span className={"st-fill " + t} style={{ width: w.toFixed(1) + "%" }} />
-      {pw > 0 ? <span className="st-pledge" style={{ left: w.toFixed(1) + "%", width: pw.toFixed(1) + "%" }} /> : null}
-      {target > 0 ? <span className="st-tick" style={{ left: tx.toFixed(1) + "%" }} /> : null}
+    <span className={"mb" + (r > 1 ? " over" : "")} title={target > 0 ? Math.round(r * 100) + "% of target" : ""}>
+      <span className={"mb-fill " + t} style={{ width: w.toFixed(1) + "%" }} />
     </span>
   );
 }
+
 
 /* ---------------------------------------------------------- master view */
 
@@ -1081,7 +1082,6 @@ function MasterView({ ctx }) {
     trend[st.id] = caps.map((s) => aggregate(s.reps, ids, stages).byStage[st.id].avgDays);
   });
 
-  const scale = Math.max.apply(null, stages.map((st) => Math.max(cur.byStage[st.id].gpv, teamFloor(data, st))).concat([1]));
   const focus = buildFocus(data, monday);
   const maxMonths = Math.max.apply(null, activeRepsOf(data).map((r) => coverOf(data, [r.id]).months).concat([tgtOne.months]));
 
@@ -1140,10 +1140,10 @@ function MasterView({ ctx }) {
           <MoveWorking data={data} repIds={ids} monday={monday} />
         </div>
         <div className="fun-head">
-          <div>Stage</div><div />
-          <div style={{ textAlign: "right" }}>GPV</div>
-          <div style={{ textAlign: "right" }}>moving out</div>
-          <div style={{ textAlign: "right" }}>Median days in stage</div>
+          <div>Stage</div>
+          <div>GPV held vs target</div>
+          <div>Moving out this week</div>
+          <div style={{ textAlign: "right" }}>Median days</div>
         </div>
         {stages.map((st, i) => {
           const a = cur.byStage[st.id];
@@ -1160,20 +1160,15 @@ function MasterView({ ctx }) {
           return (
             <div className="fun-row" key={st.id}>
               <div className="fun-name"><span className="idx">{i + 1}</span>{st.name}</div>
-              <div><Bar value={a.gpv} target={floor} scale={scale} tone={t} /></div>
-              <div className="fun-gpv">
-                {fmtMoney(a.gpv)}
-                <div style={{ fontSize: "12px", marginTop: "2px", fontWeight: 600 }}>{b ? <Delta value={a.gpv - b.gpv} /> : null}</div>
+              <div className="fun-col">
+                <span className={"fun-big tone-" + t}>{fmtMoney(a.gpv)}</span>
+                <span className="fun-sub">of {fmtMoney(floor)}</span>
+                <MiniBar value={a.gpv} target={floor} tone={t} />
               </div>
-              <div className="fun-gap">
-                <Pill tone={movedTeam >= outNeedTeam ? "good" : (movedTeam > 0 ? "warn" : "bad")}>
-                  {fmtMoney(movedTeam)} of {fmtMoney(outNeedTeam)}
-                </Pill>
-                {a.gpv < floor * 0.6 ? (
-                  <div style={{ fontSize: "11px", fontWeight: 700, marginTop: "4px", color: "var(--warn)" }}>
-                    thin
-                  </div>
-                ) : null}
+              <div className="fun-col">
+                <span className={"fun-big tone-" + tone(movedTeam, outNeedTeam)}>{fmtMoney(movedTeam)}</span>
+                <span className="fun-sub">of {fmtMoney(outNeedTeam)}</span>
+                <MiniBar value={movedTeam} target={outNeedTeam} tone={tone(movedTeam, outNeedTeam)} />
               </div>
               <div className="fun-days">
                 <span className={a.avgDays > 0 && dwellVerdict(st, a.avgDays) ? "tone-" + dwellVerdict(st, a.avgDays).tone : ""}>
@@ -1191,9 +1186,15 @@ function MasterView({ ctx }) {
           );
         })}
         <div className="fun-foot">
-          <div className="fun-name">Total pipeline</div><div />
-          <div className="fun-gpv">{fmtMoney(cur.total)}</div>
-          <div className="fun-gap" />
+          <div className="fun-name">Total pipeline</div>
+          <div className="fun-col">
+            <span className="fun-big">{fmtMoney(cur.total)}</span>
+            <span className="fun-sub">of {fmtMoney(stages.reduce((a, st) => a + teamFloor(data, st), 0))}</span>
+          </div>
+          <div className="fun-col">
+            <span className="fun-big">{fmtMoney(flow.named)}</span>
+            <span className="fun-sub">of {fmtMoney(flow.need)}</span>
+          </div>
           <div className="fun-days">{base ? <Delta value={cur.total - base.total} /> : null}</div>
         </div>
       </Section>
@@ -1337,10 +1338,6 @@ function RepView({ ctx, rep }) {
   }
   const activeStage = openStage === undefined || openStage === null ? firstShort : (openStage === "__none__" ? null : openStage);
 
-  const scale = Math.max.apply(null, stages.map((s, i) => {
-    const f = stageFlow(data, rep.id, i);
-    return Math.max(f.gpv, f.target, f.gpv + f.pledgedIn);
-  }).concat([1]));
 
   const resolved = data.commits.filter((c) => c.repId === rep.id && c.status !== "open");
   const note = (data.current[rep.id] && data.current[rep.id].note) || "";
@@ -1371,11 +1368,11 @@ function RepView({ ctx, rep }) {
           <MoveWorking data={data} repIds={[rep.id]} monday={monday} />
         </div>
         <div className="walk-head">
-          <div>Stage</div><div />
-          <div>GPV held</div>
-          <div>Moving out</div>
+          <div>Stage</div>
+          <div>GPV held vs target</div>
+          <div>Moving out this week</div>
           <div>Days in stage</div>
-          <div style={{ textAlign: "right" }}>This week</div>
+          <div style={{ textAlign: "right" }}>Action</div>
         </div>
         <div className="walk">
           {stages.map((s, i) => {
@@ -1402,14 +1399,15 @@ function RepView({ ctx, rep }) {
                     <span className="st-chev">{"\u25b6"}</span>
                     <span className={"idx st-idx tone-" + edge}>{i + 1}</span>{s.name}
                   </span>
-                  <Bar value={f.gpv} target={f.target} scale={scale} tone={t} pledged={f.pledgedIn} />
                   <span className="st-col">
-                    <span className="st-big">{fmtMoney(f.gpv)}</span>
+                    <span className={"st-big tone-" + t}>{fmtMoney(f.gpv)}</span>
                     <span className="st-small">of {fmtMoney(f.target)}</span>
+                    <MiniBar value={f.gpv} target={f.target} tone={t} />
                   </span>
                   <span className="st-col">
-                    <span className={"st-big " + (f.outShort > 0 ? "tone-warn" : "tone-good")}>{fmtMoney(f.pledgedOut)}</span>
+                    <span className={"st-big tone-" + tone(f.pledgedOut, f.outNeed)}>{fmtMoney(f.pledgedOut)}</span>
                     <span className="st-small">of {fmtMoney(f.outNeed)}</span>
+                    <MiniBar value={f.pledgedOut} target={f.outNeed} tone={tone(f.pledgedOut, f.outNeed)} />
                   </span>
                   <span className="st-col">
                     <span className={"st-big " + (dv ? "tone-" + dv.tone : "faint")}>
@@ -2242,9 +2240,9 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .all-clear{padding:16px;background:var(--good-bg);border-radius:var(--r-sm);color:var(--good);font-weight:600}
 
 /* ---------------- master funnel ---------------- */
-.fun-head{display:grid;grid-template-columns:170px 1fr 116px 116px 118px;gap:16px;padding:0 0 10px;
+.fun-head{display:grid;grid-template-columns:1fr 160px 160px 120px;gap:18px;padding:0 0 12px;
   font-size:11.5px;color:var(--faint);font-weight:700;border-bottom:1px solid var(--line)}
-.fun-row{display:grid;grid-template-columns:170px 1fr 116px 116px 118px;gap:16px;align-items:center;
+.fun-row{display:grid;grid-template-columns:1fr 160px 160px 120px;gap:18px;align-items:start;
   padding:18px 0;border-bottom:1px solid var(--line)}
 .fun-row:last-of-type{border-bottom:0}
 .fun-name{font-size:14.5px;font-weight:650;display:flex;align-items:center;gap:10px}
@@ -2255,10 +2253,13 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .fun-fill.warn{background:var(--warn-bar)}
 .fun-fill.bad{background:var(--bad-bar)}
 .fun-tick{position:absolute;top:-4px;bottom:-4px;width:3px;border-radius:2px;background:var(--ink)}
+.fun-col{display:flex;flex-direction:column;gap:2px;min-width:0}
+.fun-big{font-size:16px;font-weight:700;letter-spacing:-.02em}
+.fun-sub{font-size:11.5px;color:var(--faint);font-weight:600}
 .fun-gpv{text-align:right;font-size:16px;font-weight:700;letter-spacing:-.02em}
 .fun-gap{text-align:right;font-size:13px;font-weight:600;color:var(--slate)}
 .fun-days{text-align:right;font-size:14px;font-weight:600;color:var(--ink-2)}
-.fun-foot{display:grid;grid-template-columns:170px 1fr 116px 116px 118px;gap:16px;padding:15px 0 0;
+.fun-foot{display:grid;grid-template-columns:1fr 160px 160px 120px;gap:18px;padding:16px 0 0;
   border-top:2px solid var(--line);margin-top:4px}
 .fun-foot .fun-gpv{font-size:17px;font-weight:800}
 
@@ -2399,9 +2400,9 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .st.tone-bad{border-left:4px solid var(--bad-bar)}
 .st.tone-warn{border-left:4px solid var(--warn-bar)}
 .st.tone-good{border-left:4px solid var(--good-bar)}
-.walk-head{display:grid;grid-template-columns:1fr 150px 108px 108px 92px 116px;gap:16px;
+.walk-head{display:grid;grid-template-columns:1fr 158px 158px 104px 120px;gap:18px;
   padding:0 18px 10px;font-size:11px;font-weight:700;color:var(--faint);letter-spacing:.02em}
-.st-row{display:grid;grid-template-columns:1fr 150px 108px 108px 92px 116px;gap:16px;align-items:center;
+.st-row{display:grid;grid-template-columns:1fr 158px 158px 104px 120px;gap:18px;align-items:start;
   padding:18px;cursor:pointer;background:none;border:0;width:100%;text-align:left;font:inherit;color:inherit}
 .st-col{display:flex;flex-direction:column;gap:2px;min-width:0}
 .st-big{font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
@@ -2414,9 +2415,14 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .idx.st-idx.tone-bad{background:var(--bad-bg);color:var(--bad)}
 .st-row:hover{background:var(--paper)}
 .st-row:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
-.st-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px;letter-spacing:-.01em}
+.st-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px;letter-spacing:-.01em;padding-top:1px}
 .st-chev{color:var(--faint);font-size:9px;transition:transform .15s}
 .st.open .st-chev{transform:rotate(90deg)}
+.mb{display:block;position:relative;height:6px;border-radius:999px;background:var(--track);margin-top:6px;width:100%;overflow:hidden}
+.mb-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
+.mb-fill.warn{background:var(--warn-bar)}
+.mb-fill.bad{background:var(--bad-bar)}
+.mb.over::after{content:"";position:absolute;right:0;top:0;bottom:0;width:4px;background:var(--ink);border-radius:0 999px 999px 0}
 .st-bar{position:relative;height:14px;background:var(--track);border-radius:999px}
 .st-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
 .st-fill.warn{background:var(--warn-bar)}
@@ -2477,7 +2483,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   .head-top,.tabs{padding-left:14px;padding-right:14px}
   .section,.headline{padding:18px 16px}
   .walk-head{display:none}
-  .st-row{grid-template-columns:1fr 96px 92px;gap:10px;padding:14px}
+  .st-row{grid-template-columns:1fr 116px;gap:12px;padding:14px}
   .st-bar,.st-state{display:none}
   .cmt{grid-template-columns:1fr 96px;gap:9px}
   .focus-row{grid-template-columns:1fr auto;gap:8px}
