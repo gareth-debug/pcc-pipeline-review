@@ -9,10 +9,11 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 14;
+const DATA_VERSION = 17;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
+const AUTO_MISS_WEEKS = 2;   /* an unanswered commitment closes as a miss after this long */
 
 /* -------------------------------------------------------------- utilities */
 
@@ -362,6 +363,8 @@ function migrate(raw) {
     weekOf: c.weekOf || thisMonday(),
     status: (c.status === "moved" || c.status === "missed" || c.status === "dead") ? c.status : "open",
     resolvedWeek: c.resolvedWeek || null,
+    rolledFrom: c.rolledFrom || null,
+    autoMissed: c.autoMissed === true,
     createdAt: c.createdAt || Date.now() - 1000 * i
   }));
 
@@ -448,11 +451,15 @@ function stageFlow(d, repId, idx) {
   const next = idx < stages.length - 1 ? stages[idx + 1] : null;
   const cell = cellOf(d.current, repId, st.id);
   const target = repTarget(d, repId, st.id);
-  const open = d.commits.filter((c) => c.repId === repId && c.status === "open");
+  const monday = thisMonday();
+  const mine = d.commits.filter((c) => c.repId === repId);
+  const open = mine.filter((c) => c.status === "open");
   const inbound = open.filter((c) => c.toStage === st.id);
-  const outbound = open.filter((c) => c.fromStage === st.id);
+  const outbound = open.filter((c) => c.fromStage === st.id && c.weekOf === monday);
+  const outboundDone = mine.filter((c) => c.status === "moved" && c.fromStage === st.id && c.weekOf === monday);
   const sum = (a) => a.reduce((x, c) => x + (Number(c.gpv) || 0), 0);
-  const pledgedIn = sum(inbound), pledgedOut = sum(outbound);
+  const pledgedIn = sum(inbound);
+  const pledgedOut = sum(outbound) + sum(outboundDone);
   const gap = Math.max(0, target - cell.gpv);
   const required = gap + pledgedOut;
   const shortfall = Math.max(0, required - pledgedIn);
@@ -485,7 +492,7 @@ function stageFlow(d, repId, idx) {
   return {
     stage: st, prev, next, idx,
     gpv: cell.gpv, avgDays: cell.avgDays, target,
-    inbound, outbound, pledgedIn, pledgedOut,
+    inbound, outbound, outboundDone, pledgedIn, pledgedOut,
     gap, required, shortfall,
     outNeed, outShort, holdOk, lightBy, hole,
     monthsOfStock: outNeed > 0 ? cell.gpv / (outNeed * WEEKS_PER_MONTH) : 0,
@@ -497,6 +504,49 @@ function stageFlow(d, repId, idx) {
   };
 }
 function sourceLabel(f) { return f.prev ? f.prev.name : "new pipeline"; }
+
+/* What counts toward the weekly movement figure.
+
+   Named-but-pending AND already-moved both count: the requirement is about
+   volume crossing a boundary, so a deal marked Moved must not drop out of the
+   number the moment it succeeds. It did, and the bar ran backwards as the week
+   went well.
+
+   Missed does not count, because it did not cross. Dead does not count either:
+   the requirement is derived from what has to reach the next stage, and a
+   disqualified deal never will. Kills are worth doing and are tracked on their
+   own, but they cannot substitute for progression. */
+function movesOutOf(commit, stageId, mondayIso) {
+  if (commit.fromStage !== stageId) return false;
+  if (commit.weekOf !== mondayIso) return false;   /* this week's commitment only */
+  return commit.status === "open" || commit.status === "moved";
+}
+
+/* An unanswered commitment leaves its week provisional forever: you cannot say
+   "we hit 72% in week 1" while one deal from week 1 is still open, and someone
+   resolving it in three months would silently rewrite a number already
+   reported. After two weeks it closes as a miss, in its own week, so the week
+   finalises. It can still be reopened if it turns out it did move. */
+function sweepStaleCommits(d, mondayIso) {
+  let closed = 0;
+  d.commits.forEach((c) => {
+    if (c.status !== "open") return;
+    if (weeksBetween(c.weekOf, mondayIso) < AUTO_MISS_WEEKS) return;
+    c.status = "missed";
+    c.resolvedWeek = c.weekOf;
+    c.autoMissed = true;
+    closed += 1;
+  });
+  return closed;
+}
+
+/* Commitments made before this week that were never resolved. These are the
+   first thing a 1:1 deals with, and until they are cleared the weekly figures
+   cannot be trusted. */
+function unresolvedBefore(d, repIds, mondayIso) {
+  return d.commits.filter((c) =>
+    c.status === "open" && c.weekOf < mondayIso && repIds.indexOf(c.repId) >= 0);
+}
 
 /* ------------------------------------------------------- weighted cover */
 
@@ -551,7 +601,7 @@ function flowOf(d, repIds, monday) {
   stages.forEach((st, i) => {
     need += weeklyOutflowNeed(i) * (repIds.length || 1);
     named += d.commits
-      .filter((c) => c.status === "open" && c.fromStage === st.id && repIds.indexOf(c.repId) >= 0)
+      .filter((c) => repIds.indexOf(c.repId) >= 0 && movesOutOf(c, st.id, monday))
       .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
   });
   return { need, named, pct: need > 0 ? (named / need) * 100 : 0 };
@@ -888,7 +938,7 @@ function MoveWorking({ data, repIds, monday }) {
   const rows = stages.map((st, i) => {
     const need = weeklyOutflowNeed(i) * (repIds.length || 1);
     const named = data.commits
-      .filter((c) => c.status === "open" && c.fromStage === st.id && repIds.indexOf(c.repId) >= 0)
+      .filter((c) => repIds.indexOf(c.repId) >= 0 && movesOutOf(c, st.id, monday))
       .reduce((a, c) => a + (Number(c.gpv) || 0), 0);
     return { name: st.name, need, named, short: Math.max(0, need - named) };
   });
@@ -1075,6 +1125,8 @@ function MasterView({ ctx }) {
   const flow = flowOf(data, ids, monday);
   const newPipe = newPipelineEstimate(data, ids, monday);
   const card = scorecard(data, ids, monday);
+  const teamCarried = unresolvedBefore(data, ids, monday)
+    .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -1119,7 +1171,34 @@ function MasterView({ ctx }) {
         ) : null}
       </Section>
 
-      <Section n="3" title="This week&rsquo;s focus" hint="biggest gaps first, largest at the top" tone="bad">
+      {teamCarried.length ? (
+        <Section n="3" title="Unresolved from last week"
+          hint={teamCarried.length + " commitment" + (teamCarried.length === 1 ? "" : "s") + " across " +
+                new Set(teamCarried.map((c) => c.repId)).size + " reps \u2014 the weekly figures are incomplete until these are cleared"}
+          tone="warn">
+          <table className="tbl">
+            <thead>
+              <tr><th>Rep</th><th>Opportunity</th><th className="r nar">GPV</th>
+                <th className="nar">Committed</th><th className="r nar" /></tr>
+            </thead>
+            <tbody>
+              {teamCarried.map((c) => (
+                <tr key={c.id}>
+                  <td className="muted">{shortName(ctx.repName(c.repId))}</td>
+                  <td>{c.name || <span className="faint">unnamed</span>}</td>
+                  <td className="r nar">{fmtMoney(c.gpv)}</td>
+                  <td className="nar muted">{shortDate(c.weekOf)}</td>
+                  <td className="r nar">
+                    <button className="btn" onClick={() => setTab(c.repId)}>Open</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Section>
+      ) : null}
+
+      <Section n={teamCarried.length ? "4" : "3"} title="This week&rsquo;s focus" hint="biggest gaps first, largest at the top" tone="bad">
         {focus.length === 0 ? (
           <div className="all-clear">Every rep is on target in every stage. Short 1:1s this week.</div>
         ) : (
@@ -1135,7 +1214,7 @@ function MasterView({ ctx }) {
         )}
       </Section>
 
-      <Section n="4" title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
+      <Section n={teamCarried.length ? "5" : "4"} title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
         <div style={{ marginBottom: "16px" }}>
           <MoveWorking data={data} repIds={ids} monday={monday} />
         </div>
@@ -1155,7 +1234,7 @@ function MasterView({ ctx }) {
              what they have actually committed */
           const outNeedTeam = weeklyOutflowNeed(i) * ids.length;
           const movedTeam = data.commits
-            .filter((c) => c.status === "open" && c.fromStage === st.id && ids.indexOf(c.repId) >= 0)
+            .filter((c) => ids.indexOf(c.repId) >= 0 && movesOutOf(c, st.id, monday))
             .reduce((x, c) => x + (Number(c.gpv) || 0), 0);
           return (
             <div className="fun-row" key={st.id}>
@@ -1199,7 +1278,7 @@ function MasterView({ ctx }) {
         </div>
       </Section>
 
-      <Section n="5" title="The team"
+      <Section n={teamCarried.length ? "6" : "5"} title="The team"
         hint={"runway is months of activation covered \u2014 a healthy book covers " + tgt.months.toFixed(1)}
         action={<button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>}>
         <table className="tbl">
@@ -1330,6 +1409,11 @@ function RepView({ ctx, rep }) {
   const flow = flowOf(data, [rep.id], monday);
   const repPipe = newPipelineEstimate(data, [rep.id], monday);
   const card = scorecard(data, [rep.id], monday);
+  const carried = unresolvedBefore(data, [rep.id], monday)
+    .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
+  /* only worth showing while it is still recent enough to argue with */
+  const autoClosed = data.commits.filter((c) => c.repId === rep.id && c.autoMissed &&
+    weeksBetween(c.weekOf, monday) <= AUTO_MISS_WEEKS + 2);
 
   /* Open on the first stage that needs work, until the user picks another. */
   let firstShort = stages.length ? stages[0].id : null;
@@ -1359,7 +1443,65 @@ function RepView({ ctx, rep }) {
         ) : null}
       </Section>
 
-      <Section n="2" title="Walk the funnel"
+      {autoClosed.length ? (
+        <Section n="1b" title="Closed automatically"
+          hint={autoClosed.length + " commitment" + (autoClosed.length === 1 ? "" : "s") +
+                " went unanswered for " + AUTO_MISS_WEEKS + " weeks and were recorded as missed. Reopen any that did move."}
+          tone="warn" open={false}>
+          <div className="review">
+            {autoClosed.map((c) => (
+              <div className="rev" key={c.id}>
+                <span className="rev-main">
+                  <span className="rev-name">{c.name || <span className="faint">unnamed</span>}</span>
+                  <span className="rev-sub">
+                    {ctx.stageName(c.fromStage)} {"\u2192"} {ctx.stageName(c.toStage)} &middot; committed {shortDate(c.weekOf)}
+                  </span>
+                </span>
+                <span className="rev-gpv">{fmtMoney(c.gpv)}</span>
+                <span className="acts">
+                  <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>It did move</button>
+                  <button className="btn x" onClick={() => actions.reopenCommit(c.id)}>Reopen</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </Section>
+      ) : null}
+
+      {carried.length ? (
+        <Section n="2" title="Last week, how did it go?"
+          hint={carried.length + " commitment" + (carried.length === 1 ? "" : "s") + " still open \u2014 " +
+                fmtMoney(carried.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " \u2014 clear these first"}
+          tone="warn">
+          <div className="review">
+            {carried.map((c) => (
+              <div className="rev" key={c.id}>
+                <span className="rev-main">
+                  <span className="rev-name">{c.name || <span className="faint">unnamed</span>}</span>
+                  <span className="rev-sub">
+                    {ctx.stageName(c.fromStage)} {"\u2192"} {ctx.stageName(c.toStage)}
+                    {" \u00b7 committed "}{shortDate(c.weekOf)}
+                    {weeksBetween(c.weekOf, monday) > 1 ? " \u00b7 " + weeksBetween(c.weekOf, monday) + " weeks ago" : ""}
+                  </span>
+                </span>
+                <span className="rev-gpv">{fmtMoney(c.gpv)}</span>
+                <span className="acts">
+                  <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>Moved</button>
+                  <button className="btn no" onClick={() => actions.resolveCommit(c.id, "missed")}>Missed</button>
+                  <button className="btn kill" onClick={() => actions.resolveCommit(c.id, "dead")}>Dead</button>
+                  <button className="btn" onClick={() => actions.rollCommit(c.id)}>Roll to this week</button>
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="faint" style={{ fontSize: "12.5px", marginTop: "14px", fontWeight: 600 }}>
+            Whatever you pick lands in the week it was committed, not today, so last week&rsquo;s numbers stay
+            true. Rolling one over records it as missed then and re-commits it for this week.
+          </p>
+        </Section>
+      ) : null}
+
+      <Section n={carried.length ? "3" : "2"} title="Walk the funnel"
         hint={flow.need - flow.named > 0
           ? fmtMoney(flow.need - flow.named) + " of movement still to name this week"
           : "movement for the week is fully named"}
@@ -1457,6 +1599,16 @@ function RepView({ ctx, rep }) {
                       {f.outbound.length ? f.outbound.map((c) => (
                         <CommitRow key={c.id} commit={c} stages={stages} actions={actions} onEditing={onEditing} monday={monday} />
                       )) : <div className="cmt-none">Nothing named yet.</div>}
+                      {f.outboundDone.map((c) => (
+                        <div className="cmt done" key={c.id}>
+                          <span>{c.name || <span className="faint">unnamed</span>}</span>
+                          <span className="cmt-src">moved this week</span>
+                          <span className="flow-amt">{fmtMoney(c.gpv)}</span>
+                          <span className="acts">
+                            <button className="btn x" onClick={() => actions.reopenCommit(c.id)}>undo</button>
+                          </span>
+                        </div>
+                      ))}
                       <button className="btn primary movebox-add" onClick={() => actions.addCommitOutOf(rep.id, s.id)}>
                         + Move a deal out of {s.name}
                       </button>
@@ -1485,7 +1637,7 @@ function RepView({ ctx, rep }) {
       </Section>
 
       {resolved.length ? (
-        <Section n="3" title="Track record" open={false}
+        <Section n={carried.length ? "4" : "3"} title="Track record" open={false}
           hint={st.moved + " moved, " + st.missed + " missed, " + st.dead + " disqualified"}
           action={<button className="btn txt" onClick={() => setShowHist(!showHist)}>{showHist ? "Hide" : "Show all " + resolved.length}</button>}>
           {showHist ? (
@@ -1505,7 +1657,10 @@ function RepView({ ctx, rep }) {
                       <b>{ctx.stageName(c.fromStage)}</b> {"\u2192"} <b>{ctx.stageName(c.toStage)}</b>
                     </td>
                     <td className="nar muted">{shortDate(c.weekOf)}</td>
-                    <td className="nar"><span className={"tag " + c.status}>{c.status}</span></td>
+                    <td className="nar">
+                    <span className={"tag " + c.status}>{c.status}</span>
+                    {c.autoMissed ? <span className="tag" title={"Left unanswered for " + AUTO_MISS_WEEKS + " weeks, so it was closed automatically. Reopen if it did move."}>auto</span> : null}
+                  </td>
                     <td className="r nar"><button className="btn x" onClick={() => actions.reopenCommit(c.id)}>reopen</button></td>
                   </tr>
                 ))}
@@ -1931,6 +2086,8 @@ export default function App() {
         d.snapshots.push(makeSnapshot(d, mon, true));
         changed = true;
       }
+      const swept = sweepStaleCommits(d, mon);
+      if (swept > 0) changed = true;
       if (d.snapshots.length > MAX_SNAPSHOTS) {
         d.snapshots = d.snapshots.slice()
           .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)) || (a.takenAt || 0) - (b.takenAt || 0))
@@ -2034,8 +2191,42 @@ export default function App() {
       });
     },
     setCommit(id, field, value) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) c[field] = value; }); },
-    resolveCommit(id, st) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) { c.status = st; c.resolvedWeek = thisMonday(); } }); },
-    reopenCommit(id) { update((d) => { const c = d.commits.find((x) => x.id === id); if (c) { c.status = "open"; c.resolvedWeek = null; } }); },
+    /* Attributed to the week the commitment was made, not the day the button was
+       pressed, so a Monday review of last week lands in last week. */
+    resolveCommit(id, st) {
+      update((d) => {
+        const c = d.commits.find((x) => x.id === id);
+        if (c) { c.status = st; c.resolvedWeek = c.weekOf || thisMonday(); }
+      });
+    },
+    /* Did not happen, but still live: the old commitment is recorded as missed
+       in its own week and a fresh one is made for this week. Honest on both
+       counts, and the rep does not retype the deal. */
+    rollCommit(id) {
+      update((d) => {
+        const c = d.commits.find((x) => x.id === id);
+        if (!c) return;
+        c.status = "missed";
+        c.resolvedWeek = c.weekOf || thisMonday();
+        d.commits.push({
+          id: uid("cmt"), repId: c.repId, name: c.name, gpv: c.gpv,
+          fromStage: c.fromStage, toStage: c.toStage, weekOf: thisMonday(),
+          status: "open", resolvedWeek: null, createdAt: Date.now(), rolledFrom: c.weekOf
+        });
+      });
+    },
+    reopenCommit(id) {
+      update((d) => {
+        const c = d.commits.find((x) => x.id === id);
+        if (!c) return;
+        c.status = "open";
+        c.resolvedWeek = null;
+        c.autoMissed = false;
+        /* re-dated to this week, otherwise the sweep closes it again on the
+           next load and the rep cannot get it back */
+        c.weekOf = thisMonday();
+      });
+    },
     /* Deleting is for mistakes and experiments, so it happens immediately with
        no dialog. Undo covers the accident; Moved, Missed and Dead cover the
        cases that belong on the record. */
@@ -2459,6 +2650,14 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .tgt:hover{border-bottom-color:var(--slate);color:var(--ink)}
 .tgt:focus{outline:none;border-bottom-color:var(--accent);color:var(--ink)}
 
+.review{display:flex;flex-direction:column;gap:2px}
+.rev{display:grid;grid-template-columns:1fr 96px auto;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
+.rev:last-child{border-bottom:0}
+.rev-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.rev-name{font-size:14.5px;font-weight:650}
+.rev-sub{font-size:12px;color:var(--faint);font-weight:600}
+.rev-gpv{text-align:right;font-size:15px;font-weight:700}
+@media (max-width:760px){.rev{grid-template-columns:1fr auto;gap:8px}.rev .acts{grid-column:1/-1;justify-content:flex-start;flex-wrap:wrap}}
 .movebox{border:1.5px solid var(--line);border-radius:var(--r-sm);padding:14px 16px 16px;background:var(--card)}
 .movebox.short{border-color:#F0D9A8;background:#FFFDF8}
 .movebox.met{border-color:#CDEDE1;background:#F8FDFB}
@@ -2468,6 +2667,8 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .movebox-add{margin-top:12px}
 .cmt{display:grid;grid-template-columns:1fr 140px 108px auto;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line)}
 .cmt:last-of-type{border-bottom:0}
+.cmt.done{opacity:.72}
+.cmt.done .cmt-src{color:var(--good);font-weight:700}
 .cmt-lbl{font-size:12px;color:var(--faint);font-weight:700;margin:16px 0 4px}
 .cmt-none{font-size:13px;color:var(--faint);padding:8px 0;font-weight:500}
 .cmt-src{font-size:12.5px;color:var(--slate);font-weight:600}
