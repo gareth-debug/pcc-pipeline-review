@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 13;
+const DATA_VERSION = 14;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -202,6 +202,10 @@ function commitStats(commits, repId, mondayIso) {
    activation goal change it.
    --------------------------------------------------------------------------- */
 const ACTIVATION_PER_MONTH = 4e6;    // GPV each rep must get live every month
+
+/* The cycle US field actually runs, from the median-days chart. Targets are
+   sized on this; the dwellDays below are the pace being asked for. */
+const MEASURED_DWELL = { st_discovery: 42, st_evaluation: 38, st_negotiation: 54, st_closeplan: 33, st_implementation: 36 };
 const CONVERSION_MEASURED = 0.126;   // GPV-weighted, Discovery to live
 
 /* dwellDays is the pace being asked for; conv is measured. `floor` is derived
@@ -229,13 +233,14 @@ const STAGE_MODEL = [
 /* The book at the pace being asked for. The prize for getting faster. */
 const PER_REP_TARGET = STAGE_MODEL.reduce((a, s) => a + s.floor, 0);
 
+/* The two cycle figures the targets sit between. */
+const SELL_CYCLE_MEASURED = STAGE_MODEL.slice(0, 4).reduce((a, s) => a + (MEASURED_DWELL[s.id] || s.dwellDays), 0);
+const SELL_CYCLE_TARGET = STAGE_MODEL.slice(0, 4).reduce((a, s) => a + s.dwellDays, 0);
+
 /* New Discovery needed each week, straight from the activation goal and the
    measured conversion. Independent of how fast or slow the team runs. */
 const NEW_PIPELINE_PER_WEEK = (ACTIVATION_PER_MONTH / CONVERSION_MEASURED) / (13 / 3);
 
-/* What the measured cycle actually was, kept so the budget has something to be
-   read against in Settings. */
-const MEASURED_DWELL = { st_discovery: 42, st_evaluation: 38, st_negotiation: 54, st_closeplan: 33, st_implementation: 36 };
 
 function defaultStages() {
   return STAGE_MODEL.map((s) => Object.assign({ inCoverage: true }, s));
@@ -401,21 +406,20 @@ function activeRepsOf(d) { return d.config.reps.filter((r) => r.active !== false
 /* Each stage's `floor` is what ONE rep is expected to hold in that stage.
    The team number is that figure multiplied by the active head count, not
    divided by it. A rep can be given their own figure via d.targets. */
-/* A rep's own dwell, falling back to the US field median until they enter one,
-   so a fresh book is sized on reality rather than on the pace being asked for. */
-function repDwell(d, repId, stage) {
-  const c = cellOf(d.current, repId, stage.id);
-  if (c.avgDays > 0) return c.avgDays;
-  return MEASURED_DWELL[stage.id] || stage.dwellDays;
-}
+/* One target for everyone, sized on the cycle US field actually runs.
 
-/* What this rep must hold in this stage: flow through it times how long their
-   deals sit there. Slower rep, bigger book, same throughput. */
+   An earlier version sized each rep on their own dwell. It was arithmetically
+   right and practically useless: a rep at 183 days in Evaluation was asked for
+   $84.5M in that stage alone, which is not a target anyone can act on, and it
+   punished a slow rep twice over - red days AND an unreachable number. Speed is
+   managed through the days figure and its trend, not by inflating the book. */
 function repTarget(d, repId, stageId) {
   const stages = d.config.stages;
   const i = stages.findIndex((s) => s.id === stageId);
   if (i < 0) return 0;
-  return modelFlows()[i] * (repDwell(d, repId, stages[i]) / 30);
+  const st = stages[i];
+  const days = MEASURED_DWELL[st.id] || st.dwellDays;
+  return modelFlows()[i] * (days / 30);
 }
 
 /* The same stage at the pace being asked for. Shown alongside, as the prize. */
@@ -553,17 +557,6 @@ function flowOf(d, repIds, monday) {
   return { need, named, pct: need > 0 ? (named / need) * 100 : 0 };
 }
 
-/* A hole in a stage does not hurt today. It hurts once the deals that should
-   have passed through it would have reached activation. */
-function impactHorizon(idx) {
-  const days = STAGE_MODEL.slice(idx).reduce((a, s) => a + s.dwellDays, 0);
-  const when = new Date(Date.now() + days * 864e5);
-  return {
-    days,
-    months: days / 30.4,
-    label: MONTHS[when.getMonth()] + " " + when.getFullYear()
-  };
-}
 
 /* ------------------------------------------------- new pipeline, inferred */
 
@@ -666,7 +659,8 @@ function scorecard(d, repIds, mondayIso) {
 
   const rows = [
     row("Pipeline held", cur.total, bookNeeded, money,
-        "at the pace these books run \u2014 " + money(PER_REP_TARGET * n) + " at the 12-week target"),
+        "sized on today's " + Math.round(SELL_CYCLE_MEASURED) + "-day cycle \u2014 drops to " +
+        money(PER_REP_TARGET * n) + " at the 12-week rule"),
     row("New pipeline built",
         pipe && !pipe.unavailable ? pipe.added : 0,
         pipe && !pipe.unavailable ? pipe.need : NEW_PIPELINE_PER_WEEK * n,
@@ -1022,11 +1016,9 @@ function buildFocus(d, monday) {
         });
       }
       if (f.hole) {
-        const h = impactHorizon(i);
         light.push({
           k: "warn", sort: f.lightBy, rep: r,
-          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b>, and what goes in now activates
-            around {h.label} &mdash; a <em>{h.months.toFixed(1)}-month</em> lead time, so it has to start this week</>
+          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b></>
         });
       }
     });
@@ -1179,7 +1171,7 @@ function MasterView({ ctx }) {
                 </Pill>
                 {a.gpv < floor * 0.6 ? (
                   <div style={{ fontSize: "11px", fontWeight: 700, marginTop: "4px", color: "var(--warn)" }}>
-                    thin &middot; {impactHorizon(i).months.toFixed(1)}m lead time
+                    thin
                   </div>
                 ) : null}
               </div>
@@ -1435,7 +1427,7 @@ function RepView({ ctx, rep }) {
                   </span>
                   <span className="st-state">
                     {stateEl}
-                    {f.hole ? <span className="st-risk-dot" title={"Thin by " + fmtMoney(f.lightBy) + ". What enters now activates around " + impactHorizon(i).label + ", so closing it starts this week."} /> : null}
+                    {f.hole ? <span className="st-risk-dot" title={"Thin by " + fmtMoney(f.lightBy)} /> : null}
                   </span>
                 </button>
 
@@ -1559,12 +1551,18 @@ function SettingsView({ ctx }) {
           absolute terms. The budget spends the 12-week outcome rule across the four selling stages instead.
         </p>
         <p className="st-risk" style={{ maxWidth: "740px", marginTop: "12px" }}>
-          <b>The target moves with the rep.</b> What a stage must hold is the volume flowing through it times
-          how long deals sit there, and dwell is taken from the median days each rep enters. A rep running 42
-          days in Discovery is asked to hold twice what a rep running 21 days holds &mdash; same throughput,
-          more working capital, because slow money has to be bigger money. At the cycle US field currently
-          runs that is about <b>$89M</b> a rep; at the 12-week rule it falls to <b>{fmtMoney(PER_REP_TARGET)}</b>.
-          Getting faster visibly lowers the bar rather than being an abstract virtue.
+          <b>The book target is sized on speed, and speed is the way to lower it.</b> What a stage must hold
+          is the volume flowing through it times how long deals sit there. At the{" "}
+          {SELL_CYCLE_MEASURED}-day selling cycle US field currently runs, that is{" "}
+          <b>{fmtMoney(STAGE_MODEL.reduce((a, st) => a + modelFlows()[STAGE_MODEL.indexOf(st)] * ((MEASURED_DWELL[st.id] || st.dwellDays) / 30), 0))}</b>{" "}
+          per rep. At the {SELL_CYCLE_TARGET}-day rule it falls to <b>{fmtMoney(PER_REP_TARGET)}</b>. Same
+          activation goal, half the working capital, because deals recycle twice as fast.
+        </p>
+        <p className="muted" style={{ maxWidth: "740px", marginTop: "10px", fontSize: "13.5px" }}>
+          Everyone gets the same target. Sizing each rep on their own dwell was tried and dropped: it asked a
+          rep at 183 days in Evaluation for $84.5M in that one stage, which is not something anyone can act
+          on, and it penalised them twice for the same problem. Slow books show up in the days figure and its
+          trend instead.
         </p>
         <p className="muted" style={{ maxWidth: "740px", marginTop: "10px", fontSize: "13.5px" }}>
           Weekly movement does <b>not</b> move with dwell. Throughput is flow, not stock, so the weekly ask is
@@ -1657,10 +1655,9 @@ function SettingsView({ ctx }) {
         <p className="muted" style={{ marginTop: "14px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>Shape is not scored.</b> A dollar in Mutual close plan is worth roughly ten in Discovery, so a
           rep who is heavy late and light in the middle is ahead, not behind, and the headline reflects
-          that. A thin stage is still called out, with its lead time attached: what crosses into a stage
-          now is what activates months later, so a long lead time is a reason to close the gap this week
-          rather than a reason it can wait. Signed business and unsold pipeline are reported separately,
-          because a full implementation queue can otherwise hide a selling motion that has stopped.
+          that. A thin stage is still called out, but as a plain gap rather than a lecture. Signed business
+          and unsold pipeline are reported separately, because a full implementation queue can otherwise
+          hide a selling motion that has stopped.
         </p>
         <p className="muted" style={{ marginTop: "10px", maxWidth: "740px", fontSize: "13.5px" }}>
           <b>The holding figure is the easier half.</b> A stage that is full but never empties is a
