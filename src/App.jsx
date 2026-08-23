@@ -2766,7 +2766,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .nudge-list{margin:10px 0 14px;padding-left:20px;font-size:13.5px;color:var(--ink-2);font-weight:500}
 .nudge-list li{margin:4px 0}
 .nudge-list li.ok{color:var(--good);font-weight:600}
-.nudge-list li.ok::marker{content:"\2713  "}
+.nudge-list li.ok::marker{content:"\\2713  "}
 .review{display:flex;flex-direction:column;gap:2px}
 .rev{display:grid;grid-template-columns:1fr 96px auto;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
 .rev:last-child{border-bottom:0}
