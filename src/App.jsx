@@ -1633,7 +1633,7 @@ function RepView({ ctx, rep }) {
                     {stateEl}
                     {f.hole ? <span className="st-risk-dot" title={"Thin by " + fmtMoney(f.lightBy)} /> : null}
                   </span>
-                  <span className="st-tick">
+                  <span className="st-done">
                     {confirmed ? (
                       <button className="tick on" title={"Confirmed for the week of " + shortDate(monday) + ". Click to undo."}
                         onClick={() => actions.unconfirmStage(rep.id, s.id)}>{"\u2713"}</button>
@@ -2489,11 +2489,6 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .hero-s{font-size:14px;margin-top:8px;color:var(--ink-2);font-weight:500}
 .hero-s .short{color:var(--bad);font-weight:700}
 .hero-s .over{color:var(--good);font-weight:700}
-.minis{display:flex;gap:14px;margin-left:auto;flex-wrap:wrap}
-.mini{background:var(--paper);border-radius:var(--r-sm);padding:12px 16px;min-width:132px}
-.mini-k{font-size:12px;color:var(--slate);font-weight:600}
-.mini-v{font-size:22px;letter-spacing:-.025em;font-weight:700;margin-top:3px}
-.mini-s{font-size:12px;color:var(--faint);margin-top:1px;font-weight:500}
 
 /* the coverage gauge: the one big visual on the master tab */
 .gauge{flex:none}
@@ -2513,21 +2508,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .track-labels{display:flex;justify-content:space-between;font-size:12px;color:var(--faint);font-weight:600}
 
 /* ---------------- focus list ---------------- */
-.focus{display:flex;flex-direction:column;gap:8px}
-.focus-row{display:grid;grid-template-columns:150px 1fr auto;gap:14px;align-items:center;
   padding:12px 14px;border-radius:var(--r-sm);font-size:14px;background:var(--paper)}
-.focus-row.bad{background:var(--bad-bg)}
-.focus-row.warn{background:var(--warn-bg)}
-.focus-row.good{background:var(--good-bg)}
-.focus-who{font-weight:700;display:flex;align-items:center;gap:9px;font-size:13.5px}
-.focus-who .pip{width:9px;height:9px;border-radius:50%;flex:none}
-.focus-row.bad .pip{background:var(--bad)}
-.focus-row.warn .pip{background:var(--warn)}
-.focus-row.good .pip{background:var(--good)}
-.focus-txt{color:var(--ink-2)}
-.focus-txt em{font-style:normal;font-weight:800;color:var(--ink)}
-.focus-row.bad .focus-txt em{color:var(--bad)}
-.all-clear{padding:16px;background:var(--good-bg);border-radius:var(--r-sm);color:var(--good);font-weight:600}
 
 /* ---------------- master funnel ---------------- */
 .fun-head{display:grid;grid-template-columns:1fr 160px 160px 120px;gap:18px;padding:0 0 12px;
@@ -2538,20 +2519,12 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .fun-name{font-size:14.5px;font-weight:650;display:flex;align-items:center;gap:10px}
 .idx{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;
   background:var(--paper);color:var(--slate);font-size:11.5px;font-weight:700;flex:none}
-.fun-bar{position:relative;height:14px;background:var(--track);border-radius:999px}
-.fun-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
-.fun-fill.warn{background:var(--warn-bar)}
-.fun-fill.bad{background:var(--bad-bar)}
-.fun-tick{position:absolute;top:-4px;bottom:-4px;width:3px;border-radius:2px;background:var(--ink)}
 .fun-col{display:flex;flex-direction:column;gap:2px;min-width:0}
 .fun-big{font-size:16px;font-weight:700;letter-spacing:-.02em}
 .fun-sub{font-size:11.5px;color:var(--faint);font-weight:600}
-.fun-gpv{text-align:right;font-size:16px;font-weight:700;letter-spacing:-.02em}
-.fun-gap{text-align:right;font-size:13px;font-weight:600;color:var(--slate)}
 .fun-days{text-align:right;font-size:14px;font-weight:600;color:var(--ink-2)}
 .fun-foot{display:grid;grid-template-columns:1fr 160px 160px 120px;gap:18px;padding:16px 0 0;
   border-top:2px solid var(--line);margin-top:4px}
-.fun-foot .fun-gpv{font-size:17px;font-weight:800}
 
 /* ---------------- state pills ---------------- */
 .sp{display:inline-block;padding:4px 11px;border-radius:999px;font-size:12.5px;font-weight:700;white-space:nowrap}
@@ -2678,8 +2651,6 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .undo-btn:hover{color:#fff;text-decoration:underline;text-underline-offset:3px}
 .undo-x{background:none;border:0;color:rgba(255,255,255,.55);font:inherit;font-size:16px;cursor:pointer;padding:0 2px;line-height:1}
 .undo-x:hover{color:#fff}
-.preview-note{margin:16px 0 0;padding:11px 16px;background:var(--accent-bg);border-radius:var(--r-sm);
-  font-size:13px;color:#4457B8;font-weight:600}
 .matrix-wrap{overflow-x:auto}
 
 /* ---------------- stage walk ---------------- */
@@ -2698,7 +2669,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   cursor:pointer;text-align:left;min-width:0}
 .st-open:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
 .st-nm{font-size:15px;font-weight:700;letter-spacing:-.01em}
-.st-tick{display:flex;justify-content:flex-end;padding-top:1px}
+.st-done{display:flex;justify-content:flex-end;padding-top:1px}
 .tick{width:30px;height:30px;border-radius:9px;border:1.5px solid var(--line-2);background:#fff;color:transparent;
   font-size:15px;font-weight:800;cursor:pointer;line-height:1;padding:0}
 .tick:hover{border-color:var(--good);color:#CDEDE1}
@@ -2723,12 +2694,6 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .mb-fill.warn{background:var(--warn-bar)}
 .mb-fill.bad{background:var(--bad-bar)}
 .mb.over::after{content:"";position:absolute;right:0;top:0;bottom:0;width:4px;background:var(--ink);border-radius:0 999px 999px 0}
-.st-bar{position:relative;height:14px;background:var(--track);border-radius:999px}
-.st-fill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
-.st-fill.warn{background:var(--warn-bar)}
-.st-fill.bad{background:var(--bad-bar)}
-.st-pledge{position:absolute;top:0;bottom:0;background:repeating-linear-gradient(45deg,#BFE3D5,#BFE3D5 4px,transparent 4px,transparent 8px);border-radius:0 999px 999px 0}
-.st-tick{position:absolute;top:-4px;bottom:-4px;width:3px;border-radius:2px;background:var(--ink)}
 .st-state{text-align:right}
 .st-body{padding:6px 18px 24px 18px;border-top:1px solid var(--line);background:var(--card)}
 .st-fields{display:flex;gap:26px;align-items:center;flex-wrap:wrap;margin-bottom:20px;
