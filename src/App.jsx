@@ -9,7 +9,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 17;
+const DATA_VERSION = 19;
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -345,10 +345,20 @@ function migrate(raw) {
         avgDays: isFinite(Number(c.avgDays)) ? Number(c.avgDays) : 0
       };
     });
-    d.current[rid] = { stages: out, note: typeof src.note === "string" ? src.note : "" };
+    const conf = {};
+    if (src.confirmed && typeof src.confirmed === "object") {
+      Object.keys(src.confirmed).forEach((sid) => {
+        if (typeof src.confirmed[sid] === "string") conf[sid] = src.confirmed[sid];
+      });
+    }
+    d.current[rid] = {
+      stages: out,
+      note: typeof src.note === "string" ? src.note : "",
+      confirmed: conf
+    };
   });
   d.config.reps.forEach((r) => {
-    if (!d.current[r.id]) d.current[r.id] = { stages: {}, note: "" };
+    if (!d.current[r.id]) d.current[r.id] = { stages: {}, note: "", confirmed: {} };
   });
 
   d.commits = (Array.isArray(input.commits) ? input.commits : []).map((c, i) => ({
@@ -538,6 +548,34 @@ function sweepStaleCommits(d, mondayIso) {
     closed += 1;
   });
   return closed;
+}
+
+/* Has this rep done their weekly update?
+
+   Two halves, and both are needed. Figures cannot be inferred from the data
+   alone: a rep whose numbers genuinely did not move looks identical to one who
+   never opened the app, so touching a field stamps the week, and there is an
+   explicit "nothing changed" button for the honest quiet week. */
+function stageConfirmed(d, repId, stageId, mondayIso) {
+  const row = d.current[repId];
+  return !!(row && row.confirmed && row.confirmed[stageId] === mondayIso);
+}
+
+function repWeekStatus(d, repId, mondayIso) {
+  const stages = d.config.stages;
+  const confirmed = stages.filter((st) => stageConfirmed(d, repId, st.id, mondayIso)).length;
+  const openOld = d.commits.filter((c) =>
+    c.repId === repId && c.status === "open" && c.weekOf < mondayIso);
+  return {
+    confirmed,
+    ofStages: stages.length,
+    figuresDone: confirmed === stages.length,
+    commitsDone: openOld.length === 0,
+    openOld: openOld.length,
+    openOldGpv: openOld.reduce((a, c) => a + (Number(c.gpv) || 0), 0),
+    namedThisWeek: d.commits.filter((c) => c.repId === repId && c.weekOf === mondayIso).length,
+    done: confirmed === stages.length && openOld.length === 0
+  };
 }
 
 /* Commitments made before this week that were never resolved. These are the
@@ -958,6 +996,10 @@ function MoveWorking({ data, repIds, monday }) {
    chapters rather than one continuous wall. Collapsing is per section and
    remembered while the tab is open, so a manager can shut what they are not
    using this week. */
+/* Numbers come from a counter rather than being written by hand, because
+   sections appear and disappear conditionally and hand-numbering drifts. */
+function makeCounter() { let i = 0; return () => String(++i); }
+
 function Section({ n, title, hint, action, tone: t, children, open: openDefault }) {
   const [open, setOpen] = useState(openDefault !== false);
   return (
@@ -1054,63 +1096,6 @@ function MiniBar({ value, target, tone: t }) {
 
 /* ---------------------------------------------------------- master view */
 
-function buildFocus(d, monday) {
-  const moves = [], light = [], extras = [];
-  activeRepsOf(d).forEach((r) => {
-    d.config.stages.forEach((st, i) => {
-      const f = stageFlow(d, r.id, i);
-      if (f.state === "move") {
-        moves.push({
-          k: "bad", sort: f.outShort, rep: r,
-          text: <>needs <em>{fmtMoney(f.outShort)}</em> more named out of <b>{st.name}</b>
-            {" "}into {f.next ? f.next.name : "live"} this week</>
-        });
-      }
-      if (f.hole) {
-        light.push({
-          k: "warn", sort: f.lightBy, rep: r,
-          text: <>is <em>{fmtMoney(f.lightBy)}</em> light in <b>{st.name}</b></>
-        });
-      }
-    });
-  });
-  moves.sort((a, b) => b.sort - a.sort);
-  light.sort((a, b) => b.sort - a.sort);
-
-  d.commits.filter((c) => c.status === "open" && weeksBetween(c.weekOf, monday) >= 2).forEach((c) => {
-    const rep = d.config.reps.filter((r) => r.id === c.repId)[0];
-    extras.push({
-      k: "warn", rep,
-      text: <><b>{c.name || "An unnamed deal"}</b> has not moved in <em>{weeksBetween(c.weekOf, monday)} weeks</em></>
-    });
-  });
-  activeRepsOf(d).forEach((r) => {
-    if (commitStats(d.commits, r.id, monday).thisWeek.length === 0) {
-      extras.push({ k: "warn", rep: r, text: <>has named nothing to move this week</> });
-    }
-    /* Direction of travel beats an absolute number: a stage getting slower
-       over a month is worth raising whatever the headline figure is. */
-    d.config.stages.forEach((st) => {
-      const c = cellOf(d.current, r.id, st.id);
-      const v = dwellVerdict(st, c.avgDays);
-      if (v && v.tone === "bad") {
-        extras.push({
-          k: "warn", rep: r,
-          text: <><b>{st.name}</b> is running <em>{Math.round(c.avgDays)} days</em> against a {st.dwellDays}-day budget</>
-        });
-      }
-      const t = daysTrends(d, [r.id], st.id, monday).filter((x) => x.ok && x.weeks === 4)[0];
-      if (t && t.pct >= 15) {
-        extras.push({
-          k: "warn", rep: r,
-          text: <><b>{st.name}</b> has slowed <em>{Math.round(t.pct)}%</em> over four weeks,
-            from {fmtDays(t.then)} to {fmtDays(cellOf(d.current, r.id, st.id).avgDays)}</>
-        });
-      }
-    });
-  });
-  return moves.slice(0, 5).concat(light.slice(0, 2)).concat(extras.slice(0, 2));
-}
 
 function MasterView({ ctx }) {
   const { data, stages, ids, monday, baseline, actions, onEditing, setTab } = ctx;
@@ -1125,8 +1110,7 @@ function MasterView({ ctx }) {
   const flow = flowOf(data, ids, monday);
   const newPipe = newPipelineEstimate(data, ids, monday);
   const card = scorecard(data, ids, monday);
-  const teamCarried = unresolvedBefore(data, ids, monday)
-    .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
+  const secN = makeCounter();
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -1134,18 +1118,17 @@ function MasterView({ ctx }) {
     trend[st.id] = caps.map((s) => aggregate(s.reps, ids, stages).byStage[st.id].avgDays);
   });
 
-  const focus = buildFocus(data, monday);
   const maxMonths = Math.max.apply(null, activeRepsOf(data).map((r) => coverOf(data, [r.id]).months).concat([tgtOne.months]));
 
   return (
     <>
-      <Section n="1" title="Where we are against goal"
+      <Section n={secN()} title="Where we are against goal"
         hint="everything the model asks for, in one place"
         tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
         <Scorecard rows={card} />
       </Section>
 
-      <Section n="2" title="Pipeline runway"
+      <Section n={secN()} title="Pipeline runway"
         hint="how long the book lasts, and what it is worth"
         tone={coverTone}>
         <div className="headline-row">
@@ -1171,50 +1154,94 @@ function MasterView({ ctx }) {
         ) : null}
       </Section>
 
-      {teamCarried.length ? (
-        <Section n="3" title="Unresolved from last week"
-          hint={teamCarried.length + " commitment" + (teamCarried.length === 1 ? "" : "s") + " across " +
-                new Set(teamCarried.map((c) => c.repId)).size + " reps \u2014 the weekly figures are incomplete until these are cleared"}
-          tone="warn">
-          <table className="tbl">
-            <thead>
-              <tr><th>Rep</th><th>Opportunity</th><th className="r nar">GPV</th>
-                <th className="nar">Committed</th><th className="r nar" /></tr>
-            </thead>
-            <tbody>
-              {teamCarried.map((c) => (
-                <tr key={c.id}>
-                  <td className="muted">{shortName(ctx.repName(c.repId))}</td>
-                  <td>{c.name || <span className="faint">unnamed</span>}</td>
-                  <td className="r nar">{fmtMoney(c.gpv)}</td>
-                  <td className="nar muted">{shortDate(c.weekOf)}</td>
+      <Section n={secN()} title="Weekly check-in"
+        hint={"who has been through their stages for the week of " + shortDate(monday)}
+        tone={activeRepsOf(data).every((r) => repWeekStatus(data, r.id, monday).done) ? "good" : "warn"}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>Rep</th>
+              <th className="r nar">Stages ticked</th>
+              <th className="r nar">Last week&rsquo;s deals</th>
+              <th className="r nar">Status</th>
+              <th className="r nar" />
+            </tr>
+          </thead>
+          <tbody>
+            {activeRepsOf(data).map((r) => {
+              const w = repWeekStatus(data, r.id, monday);
+              return (
+                <tr key={r.id}>
+                  <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
                   <td className="r nar">
-                    <button className="btn" onClick={() => setTab(c.repId)}>Open</button>
+                    <Pill tone={w.figuresDone ? "good" : (w.confirmed > 0 ? "warn" : "bad")}>
+                      {w.confirmed} of {w.ofStages}
+                    </Pill>
+                  </td>
+                  <td className="r nar">
+                    {w.commitsDone
+                      ? <Pill tone="good">answered</Pill>
+                      : <Pill tone="bad">{w.openOld} open &middot; {fmtMoney(w.openOldGpv)}</Pill>}
+                  </td>
+                  <td className="r nar">
+                    {w.done ? <Pill tone="good">done</Pill> : <Pill tone="warn">outstanding</Pill>}
+                  </td>
+                  <td className="r nar">
+                    {w.done ? null : <button className="btn" onClick={() => setTab(r.id)}>Open</button>}
                   </td>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </Section>
-      ) : null}
-
-      <Section n={teamCarried.length ? "4" : "3"} title="This week&rsquo;s focus" hint="biggest gaps first, largest at the top" tone="bad">
-        {focus.length === 0 ? (
-          <div className="all-clear">Every rep is on target in every stage. Short 1:1s this week.</div>
-        ) : (
-          <div className="focus">
-            {focus.map((f, i) => (
-              <div key={i} className={"focus-row " + f.k}>
-                <div className="focus-who"><span className="pip" />{f.rep ? shortName(f.rep.name) : "Team"}</div>
-                <div className="focus-txt">{f.text}</div>
-                <div><button className="btn" onClick={() => setTab(f.rep ? f.rep.id : "master")}>Open</button></div>
-              </div>
-            ))}
-          </div>
-        )}
+              );
+            })}
+          </tbody>
+        </table>
       </Section>
 
-      <Section n={teamCarried.length ? "5" : "4"} title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
+      <Section n={secN()} title="Deals named to move"
+        hint={fmtMoney(flow.named) + " of " + fmtMoney(flow.need) + " named across the team this week"}
+        tone={tone(flow.named, flow.need)}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>Rep</th>
+              <th className="r nar">Named</th>
+              <th className="r nar">Needed</th>
+              <th className="prog">Progress</th>
+              <th className="r nar">Deals</th>
+              <th className="r nar">Biggest gap</th>
+            </tr>
+          </thead>
+          <tbody>
+            {activeRepsOf(data).map((r) => {
+              const fl = flowOf(data, [r.id], monday);
+              const named = data.commits.filter((c) => c.repId === r.id && c.weekOf === monday).length;
+              let worst = null;
+              stages.forEach((st, i) => {
+                const sf = stageFlow(data, r.id, i);
+                if (sf.outShort > 0 && (!worst || sf.outShort > worst.short)) {
+                  worst = { name: st.name, short: sf.outShort };
+                }
+              });
+              const t2 = tone(fl.named, fl.need);
+              return (
+                <tr key={r.id}>
+                  <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
+                  <td className="r nar strong">{fmtMoney(fl.named)}</td>
+                  <td className="r nar muted">{fmtMoney(fl.need)}</td>
+                  <td className="prog">
+                    <span className="repbar"><span className={t2} style={{ width: Math.min(100, fl.need > 0 ? (fl.named / fl.need) * 100 : 0).toFixed(1) + "%" }} /></span>
+                  </td>
+                  <td className="r nar">{named ? named : <span className="faint">none</span>}</td>
+                  <td className="r nar">
+                    {worst ? <Pill tone="warn">{worst.name} {fmtMoney(worst.short)}</Pill> : <Pill tone="good">covered</Pill>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </Section>
+
+      <Section n={secN()} title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
         <div style={{ marginBottom: "16px" }}>
           <MoveWorking data={data} repIds={ids} monday={monday} />
         </div>
@@ -1278,7 +1305,7 @@ function MasterView({ ctx }) {
         </div>
       </Section>
 
-      <Section n={teamCarried.length ? "6" : "5"} title="The team"
+      <Section n={secN()} title="The team"
         hint={"runway is months of activation covered \u2014 a healthy book covers " + tgt.months.toFixed(1)}
         action={<button className="btn txt" onClick={actions.toggleMatrix}>{ctx.showMatrix ? "Hide" : "Show"} stage breakdown</button>}>
         <table className="tbl">
@@ -1409,6 +1436,8 @@ function RepView({ ctx, rep }) {
   const flow = flowOf(data, [rep.id], monday);
   const repPipe = newPipelineEstimate(data, [rep.id], monday);
   const card = scorecard(data, [rep.id], monday);
+  const secN = makeCounter();
+  const status = repWeekStatus(data, rep.id, monday);
   const carried = unresolvedBefore(data, [rep.id], monday)
     .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
   /* only worth showing while it is still recent enough to argue with */
@@ -1428,7 +1457,7 @@ function RepView({ ctx, rep }) {
 
   return (
     <>
-      <Section n="1" title={rep.name + " against goal"}
+      <Section n={secN()} title={rep.name + " against goal"}
         hint="the same measures as the team view, scored for one book"
         tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
         <Scorecard rows={card} />
@@ -1443,8 +1472,37 @@ function RepView({ ctx, rep }) {
         ) : null}
       </Section>
 
+      {!status.done ? (
+        <div className="nudge">
+          <div className="nudge-t">This week&rsquo;s update isn&rsquo;t done</div>
+          <ol className="nudge-list">
+            <li className={status.commitsDone ? "ok" : ""}>
+              {status.commitsDone
+                ? "Last week's deals are all answered"
+                : "Answer last week's " + status.openOld + " deal" + (status.openOld === 1 ? "" : "s") +
+                  " \u2014 " + fmtMoney(status.openOldGpv)}
+            </li>
+            <li className={status.figuresDone ? "ok" : ""}>
+              {status.figuresDone
+                ? "All " + status.ofStages + " stages checked and ticked"
+                : "Check each stage against the Salesforce report and tick it \u2014 " +
+                  status.confirmed + " of " + status.ofStages + " done"}
+            </li>
+          </ol>
+          {!status.figuresDone ? (
+            <button className="btn" onClick={() => actions.confirmAllStages(rep.id)}>
+              Tick all {status.ofStages} stages as checked
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <div className="nudge done">
+          <div className="nudge-t">{"\u2713"} Checked in for the week of {shortDate(monday)}</div>
+        </div>
+      )}
+
       {autoClosed.length ? (
-        <Section n="1b" title="Closed automatically"
+        <Section n={secN()} title="Closed automatically"
           hint={autoClosed.length + " commitment" + (autoClosed.length === 1 ? "" : "s") +
                 " went unanswered for " + AUTO_MISS_WEEKS + " weeks and were recorded as missed. Reopen any that did move."}
           tone="warn" open={false}>
@@ -1469,7 +1527,7 @@ function RepView({ ctx, rep }) {
       ) : null}
 
       {carried.length ? (
-        <Section n="2" title="Last week, how did it go?"
+        <Section n={secN()} title="Last week, how did it go?"
           hint={carried.length + " commitment" + (carried.length === 1 ? "" : "s") + " still open \u2014 " +
                 fmtMoney(carried.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " \u2014 clear these first"}
           tone="warn">
@@ -1501,7 +1559,7 @@ function RepView({ ctx, rep }) {
         </Section>
       ) : null}
 
-      <Section n={carried.length ? "3" : "2"} title="Walk the funnel"
+      <Section n={secN()} title="Walk the funnel"
         hint={flow.need - flow.named > 0
           ? fmtMoney(flow.need - flow.named) + " of movement still to name this week"
           : "movement for the week is fully named"}
@@ -1515,6 +1573,7 @@ function RepView({ ctx, rep }) {
           <div>Moving out this week</div>
           <div>Days in stage</div>
           <div style={{ textAlign: "right" }}>Action</div>
+          <div style={{ textAlign: "right" }}>Done</div>
         </div>
         <div className="walk">
           {stages.map((s, i) => {
@@ -1527,6 +1586,7 @@ function RepView({ ctx, rep }) {
             const isOpen = s.id === activeStage;
             const t = tone(f.gpv, f.target);
             const dv = dwellVerdict(s, f.avgDays);
+            const confirmed = stageConfirmed(data, rep.id, s.id, monday);
             const edge = f.state === "move" ? "warn" : (f.state === "ok" ? "good" : "bad");
 
             const stateEl =
@@ -1536,11 +1596,12 @@ function RepView({ ctx, rep }) {
 
             return (
               <div key={s.id} className={"st" + (isOpen ? " open" : "") + " tone-" + edge}>
-                <button className="st-row" onClick={() => setOpenStage(isOpen ? "__none__" : s.id)}>
-                  <span className="st-name">
+                <div className={"st-row" + (confirmed ? "" : " unconfirmed")}>
+                  <button className="st-open" onClick={() => setOpenStage(isOpen ? "__none__" : s.id)}>
                     <span className="st-chev">{"\u25b6"}</span>
-                    <span className={"idx st-idx tone-" + edge}>{i + 1}</span>{s.name}
-                  </span>
+                    <span className={"idx st-idx tone-" + edge}>{i + 1}</span>
+                    <span className="st-nm">{s.name}</span>
+                  </button>
                   <span className="st-col">
                     <span className={"st-big tone-" + t}>{fmtMoney(f.gpv)}</span>
                     <span className="st-small">of {fmtMoney(f.target)}</span>
@@ -1569,7 +1630,16 @@ function RepView({ ctx, rep }) {
                     {stateEl}
                     {f.hole ? <span className="st-risk-dot" title={"Thin by " + fmtMoney(f.lightBy)} /> : null}
                   </span>
-                </button>
+                  <span className="st-tick">
+                    {confirmed ? (
+                      <button className="tick on" title={"Confirmed for the week of " + shortDate(monday) + ". Click to undo."}
+                        onClick={() => actions.unconfirmStage(rep.id, s.id)}>{"\u2713"}</button>
+                    ) : (
+                      <button className="tick" title="Confirm this stage for the week"
+                        onClick={() => actions.confirmStage(rep.id, s.id)}>{"\u2713"}</button>
+                    )}
+                  </span>
+                </div>
 
                 {isOpen ? (
                   <div className="st-body">
@@ -1637,7 +1707,7 @@ function RepView({ ctx, rep }) {
       </Section>
 
       {resolved.length ? (
-        <Section n={carried.length ? "4" : "3"} title="Track record" open={false}
+        <Section n={secN()} title="Track record" open={false}
           hint={st.moved + " moved, " + st.missed + " missed, " + st.dead + " disqualified"}
           action={<button className="btn txt" onClick={() => setShowHist(!showHist)}>{showHist ? "Hide" : "Show all " + resolved.length}</button>}>
           {showHist ? (
@@ -1679,6 +1749,7 @@ function RepView({ ctx, rep }) {
 
 function SettingsView({ ctx }) {
   const { data, stages, actions, onEditing } = ctx;
+  const secN = makeCounter();
   const n = activeRepsOf(data).length || 1;
   const floorSum = stages.reduce((a, s) => a + (Number(s.floor) || 0), 0);
   const flows = modelFlows();
@@ -1686,7 +1757,7 @@ function SettingsView({ ctx }) {
 
   return (
     <>
-      <Section n="1" title="The model" hint="fixed targets, sized from the activation goal &mdash; nothing here is editable">
+      <Section n={secN()} title="The model" hint="fixed targets, sized from the activation goal &mdash; nothing here is editable">
         <p className="muted" style={{ marginTop: 0, maxWidth: "740px", fontSize: "14px" }}>
           Every rep carries <b>{fmtMoney(PER_REP_TARGET)}</b> of pipeline. It is not a round number someone
           picked: it is what has to sit in the book to get <b>{fmtMoney(ACTIVATION_PER_MONTH)} a month</b> live,
@@ -1823,7 +1894,7 @@ function SettingsView({ ctx }) {
         </p>
       </Section>
 
-      <Section n="2" title="Reps" hint="unticking keeps history and drops them from the team total, but every active rep still carries the full per-rep target">
+      <Section n={secN()} title="Reps" hint="unticking keeps history and drops them from the team total, but every active rep still carries the full per-rep target">
         <table className="tbl">
           <thead>
             <tr><th>Name</th><th className="nar">Active</th><th className="r nar">Pipeline</th><th className="r nar">Target</th><th className="r nar">Gap</th><th className="r nar" /></tr>
@@ -1851,7 +1922,7 @@ function SettingsView({ ctx }) {
         </div>
       </Section>
 
-      <Section n="3" title="Captures" hint="Monday captures set the baseline; manual ones are history only" open={false}>
+      <Section n={secN()} title="Captures" hint="Monday captures set the baseline; manual ones are history only" open={false}>
         <table className="tbl">
           <thead>
             <tr><th className="nar">Week of</th><th className="nar">Taken</th><th className="nar">Kind</th><th className="r nar">Pipeline then</th><th className="r nar" /></tr>
@@ -1875,7 +1946,7 @@ function SettingsView({ ctx }) {
         </table>
       </Section>
 
-      <Section n="4" title="Data" hint="nothing here is lost by redeploying the app" open={false}>
+      <Section n={secN()} title="Data" hint="nothing here is lost by redeploying the app" open={false}>
         <div className="row-acts">
           <button className="btn" onClick={actions.copyBackup}>Copy everything as JSON</button>
           <button className="btn" onClick={actions.loadSample}>Load sample numbers</button>
@@ -2153,16 +2224,38 @@ export default function App() {
   const actions = useMemo(() => ({
     setCell(repId, stageId, field, value) {
       update((d) => {
-        if (!d.current[repId]) d.current[repId] = { stages: {}, note: "" };
+        if (!d.current[repId]) d.current[repId] = { stages: {}, note: "", confirmed: {} };
         if (!d.current[repId].stages[stageId]) d.current[repId].stages[stageId] = { gpv: 0, avgDays: 0 };
         d.current[repId].stages[stageId][field] = value;
+      });
+    },
+    /* The tick is the signal, not the typing. A stage whose numbers genuinely
+       did not move still has to be looked at and confirmed, otherwise a quiet
+       week and an ignored one are indistinguishable. */
+    confirmStage(repId, stageId) {
+      update((d) => {
+        if (!d.current[repId]) d.current[repId] = { stages: {}, note: "", confirmed: {} };
+        if (!d.current[repId].confirmed) d.current[repId].confirmed = {};
+        d.current[repId].confirmed[stageId] = thisMonday();
+      });
+    },
+    unconfirmStage(repId, stageId) {
+      update((d) => {
+        if (d.current[repId] && d.current[repId].confirmed) delete d.current[repId].confirmed[stageId];
+      });
+    },
+    confirmAllStages(repId) {
+      update((d) => {
+        if (!d.current[repId]) d.current[repId] = { stages: {}, note: "", confirmed: {} };
+        if (!d.current[repId].confirmed) d.current[repId].confirmed = {};
+        d.config.stages.forEach((st) => { d.current[repId].confirmed[st.id] = thisMonday(); });
       });
     },
     addRep() {
       update((d) => {
         const id = uid("rep");
         d.config.reps.push({ id, name: "New rep", active: true });
-        d.current[id] = { stages: {}, note: "" };
+        d.current[id] = { stages: {}, note: "", confirmed: {} };
       });
     },
     setRepName(id, v) { update((d) => { const r = d.config.reps.find((x) => x.id === id); if (r) r.name = v || r.name; }); },
@@ -2262,7 +2355,7 @@ export default function App() {
       if (!window.confirm("Clear all GPV, days, commits and captures? Reps, stages, floors and targets stay.")) return;
       update((d) => {
         d.current = {};
-        d.config.reps.forEach((r) => { d.current[r.id] = { stages: {}, note: "" }; });
+        d.config.reps.forEach((r) => { d.current[r.id] = { stages: {}, note: "", confirmed: {} }; });
         d.commits = [];
         d.snapshots = [];
       });
@@ -2591,10 +2684,20 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .st.tone-bad{border-left:4px solid var(--bad-bar)}
 .st.tone-warn{border-left:4px solid var(--warn-bar)}
 .st.tone-good{border-left:4px solid var(--good-bar)}
-.walk-head{display:grid;grid-template-columns:1fr 158px 158px 104px 120px;gap:18px;
+.walk-head{display:grid;grid-template-columns:1fr 150px 150px 96px 112px 44px;gap:16px;
   padding:0 18px 10px;font-size:11px;font-weight:700;color:var(--faint);letter-spacing:.02em}
-.st-row{display:grid;grid-template-columns:1fr 158px 158px 104px 120px;gap:18px;align-items:start;
-  padding:18px;cursor:pointer;background:none;border:0;width:100%;text-align:left;font:inherit;color:inherit}
+.st-row{display:grid;grid-template-columns:1fr 150px 150px 96px 112px 44px;gap:16px;align-items:start;padding:18px}
+.st-row.unconfirmed{background:#FFFCF5}
+.st-open{display:flex;align-items:center;gap:10px;background:none;border:0;padding:0;font:inherit;color:inherit;
+  cursor:pointer;text-align:left;min-width:0}
+.st-open:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+.st-nm{font-size:15px;font-weight:700;letter-spacing:-.01em}
+.st-tick{display:flex;justify-content:flex-end;padding-top:1px}
+.tick{width:30px;height:30px;border-radius:9px;border:1.5px solid var(--line-2);background:#fff;color:transparent;
+  font-size:15px;font-weight:800;cursor:pointer;line-height:1;padding:0}
+.tick:hover{border-color:var(--good);color:#CDEDE1}
+.tick.on{background:var(--good);border-color:var(--good);color:#fff}
+.tick.on:hover{background:#0C8A62}
 .st-col{display:flex;flex-direction:column;gap:2px;min-width:0}
 .st-big{font-size:15px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
 .st-small{font-size:11.5px;color:var(--faint);font-weight:600;white-space:nowrap}
@@ -2604,7 +2707,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .idx.st-idx.tone-good{background:var(--good-bg);color:var(--good)}
 .idx.st-idx.tone-warn{background:var(--warn-bg);color:var(--warn)}
 .idx.st-idx.tone-bad{background:var(--bad-bg);color:var(--bad)}
-.st-row:hover{background:var(--paper)}
+.st-open:hover .st-nm{color:var(--accent)}
 .st-row:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
 .st-name{font-size:15px;font-weight:700;display:flex;align-items:center;gap:10px;letter-spacing:-.01em;padding-top:1px}
 .st-chev{color:var(--faint);font-size:9px;transition:transform .15s}
@@ -2650,6 +2753,14 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .tgt:hover{border-bottom-color:var(--slate);color:var(--ink)}
 .tgt:focus{outline:none;border-bottom-color:var(--accent);color:var(--ink)}
 
+.nudge{background:var(--warn-bg);border:1.5px solid #F0D9A8;border-radius:var(--r);padding:18px 20px;margin-top:22px}
+.nudge.done{background:var(--good-bg);border-color:#CDEDE1;padding:14px 20px}
+.nudge-t{font-size:15px;font-weight:750;color:var(--warn);letter-spacing:-.01em}
+.nudge.done .nudge-t{color:var(--good)}
+.nudge-list{margin:10px 0 14px;padding-left:20px;font-size:13.5px;color:var(--ink-2);font-weight:500}
+.nudge-list li{margin:4px 0}
+.nudge-list li.ok{color:var(--good);font-weight:600}
+.nudge-list li.ok::marker{content:"\2713  "}
 .review{display:flex;flex-direction:column;gap:2px}
 .rev{display:grid;grid-template-columns:1fr 96px auto;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
 .rev:last-child{border-bottom:0}
@@ -2684,7 +2795,7 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
   .head-top,.tabs{padding-left:14px;padding-right:14px}
   .section,.headline{padding:18px 16px}
   .walk-head{display:none}
-  .st-row{grid-template-columns:1fr 116px;gap:12px;padding:14px}
+  .st-row{grid-template-columns:1fr 96px 44px;gap:10px;padding:14px}
   .st-bar,.st-state{display:none}
   .cmt{grid-template-columns:1fr 96px;gap:9px}
   .focus-row{grid-template-columns:1fr auto;gap:8px}
