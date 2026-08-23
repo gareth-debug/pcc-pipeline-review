@@ -10,6 +10,9 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    ========================================================================== */
 
 const DATA_VERSION = 19;
+/* Bumped by hand on every file I send, and shown in the header, so "did the
+   upload land?" is answerable at a glance instead of by hunting for a feature. */
+const BUILD = "19";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -2397,6 +2400,7 @@ export default function App() {
             <h1>Cheeky Pipeline Review</h1>
             <span className="wk">
               Week of {shortDate(monday)}{baseline ? " \u00b7 baseline " + shortDate(baseline.weekOf) : ""}
+              <span className="build">build {BUILD}</span>
             </span>
           </div>
           <div className="head-right">
@@ -2465,6 +2469,8 @@ body{background:var(--paper);color:var(--ink);font-family:var(--font);font-size:
 .brand h1{margin:0;font-size:20px;font-weight:800;letter-spacing:-.03em}
 .brand .wk{font-size:13px;color:var(--slate);font-weight:500}
 .head-right{display:flex;align-items:center;gap:10px}
+.build{display:inline-block;margin-left:8px;padding:2px 7px;border-radius:999px;background:var(--paper);
+  color:var(--faint);font-size:11px;font-weight:700;vertical-align:middle}
 .pill{font-size:12px;color:var(--slate);white-space:nowrap;font-weight:500}
 
 .tabs{display:flex;align-items:center;gap:6px;max-width:1180px;margin:0 auto;padding:2px 24px 10px;overflow-x:auto;scrollbar-width:thin}
