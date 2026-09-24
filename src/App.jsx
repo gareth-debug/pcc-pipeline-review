@@ -9,14 +9,19 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 21;
+const DATA_VERSION = 22;
 /* Bumped by hand on every file I send, and shown in the header, so "did the
    upload land?" is answerable at a glance instead of by hunting for a feature. */
-const BUILD = "21";
+const BUILD = "22";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
-const AUTO_MISS_WEEKS = 2;   /* an unanswered commitment closes as a miss after this long */
+const AUTO_MISS_WEEKS = 2;
+/* Leaving the last stage is not "moving to nothing", it is going live. Giving
+   that destination a name makes the final commitment read like every other one
+   and gives the Activated figure something concrete to point at. */
+const ACTIVE_STAGE = "st_active";
+const ACTIVE_NAME = "Active";   /* an unanswered commitment closes as a miss after this long */
 
 /* -------------------------------------------------------------- utilities */
 
@@ -364,6 +369,7 @@ function migrate(raw) {
     if (!d.current[r.id]) d.current[r.id] = { stages: {}, note: "", confirmed: {} };
   });
 
+  const lastStageId = d.config.stages.length ? d.config.stages[d.config.stages.length - 1].id : "";
   d.commits = (Array.isArray(input.commits) ? input.commits : []).map((c, i) => ({
     id: c.id || uid("cmt"),
     repId: c.repId || "",
@@ -372,7 +378,9 @@ function migrate(raw) {
     /* v1 allowed a "new" pseudo-source into the first stage; that concept is
        gone, so those commits keep their destination and lose the source. */
     fromStage: c.fromStage === "new" ? "" : (c.fromStage || ""),
-    toStage: c.toStage || "",
+    /* commits made before Active existed stored "" as the destination out of the
+       last stage; name it now so old rows read the same as new ones */
+    toStage: c.toStage || (c.fromStage === lastStageId ? ACTIVE_STAGE : ""),
     weekOf: c.weekOf || thisMonday(),
     status: (c.status === "moved" || c.status === "missed" || c.status === "dead") ? c.status : "open",
     resolvedWeek: c.resolvedWeek || null,
@@ -760,22 +768,11 @@ function scorecard(d, repIds, mondayIso) {
     stages.some((st) => cellOf(d.current, rid, st.id).gpv > 0)).length;
 
   const rows = [
-    row("Pipeline held", cur.total, bookNeeded, money,
-        "sized on today's " + Math.round(SELL_CYCLE_MEASURED) + "-day cycle \u2014 drops to " +
-        money(PER_REP_TARGET * n) + " at the 12-week rule"),
-    row("New pipeline built",
-        pipe && !pipe.unavailable ? pipe.added : 0,
-        pipe && !pipe.unavailable ? pipe.need : NEW_PIPELINE_PER_WEEK * n,
-        money,
-        !pipe ? "no capture to compare against"
-          : pipe.unavailable ? "needs a capture with numbers in it, so not measurable yet"
-          : "since " + shortDate(pipe.since) + (pipe.skipped > 0
-              ? " \u00b7 " + pipe.skipped + " rep" + (pipe.skipped === 1 ? "" : "s") + " left out, first week of data"
-              : "")),
-    row("Moving up a stage", flow.named, flow.need, money, "named this week"),
-    row("Activated", activated, activationGoal, money, "left the final stage this week"),
-    row("Runway", cover.months, tgt.months, months, "how long the book lasts"),
-    row("Stages on target", onTarget, stages.length, count, "GPV at or above the floor")
+    row("Pipeline GPV", cur.total, bookNeeded, money, "held across all five stages"),
+    row("Moving up a stage", flow.named, flow.need, money, "named for this week"),
+    row("Activated", activated, activationGoal, money, "gone live this week"),
+    row("Runway", cover.months, tgt.months, months, "months of activation covered"),
+    row("Stages on target", onTarget, stages.length, count, "at or above their target")
   ];
   rows.reporting = reporting;
   rows.of = n;
@@ -913,6 +910,7 @@ function StageSelect({ value, stages, onChange, onEditing }) {
     >
       <option value="">{"stage\u2026"}</option>
       {stages.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+      <option value={ACTIVE_STAGE}>{ACTIVE_NAME}</option>
     </select>
   );
 }
@@ -1068,45 +1066,31 @@ function Section({ n, title, hint, action, tone: t, children, open: openDefault 
   );
 }
 
-function Scorecard({ rows, caption }) {
+function Scorecard({ rows }) {
   const partial = rows.of > 1 && rows.reporting < rows.of;
   return (
     <>
       {partial ? (
-        <p className="st-risk" style={{ marginBottom: "14px" }}>
-          Only <b>{rows.reporting} of {rows.of}</b> reps have numbers in. Everything below counts the
-          missing ones as zero, so the team is being read low until they fill in.
+        <p className="st-risk" style={{ marginBottom: "16px" }}>
+          Only <b>{rows.reporting} of {rows.of}</b> reps have numbers in, so the team is being read low.
         </p>
       ) : null}
-    <table className="tbl score">
-      <thead>
-        <tr>
-          <th>{caption || "Measure"}</th>
-          <th className="r nar">Now</th>
-          <th className="r nar">Goal</th>
-          <th className="prog">Progress</th>
-          <th className="r nar">Status</th>
-        </tr>
-      </thead>
-      <tbody>
+      <div className="cards">
         {rows.map((r) => (
-          <tr key={r.label}>
-            <td>
-              <div className="score-label">{r.label}</div>
-              <div className="score-note">{r.note}</div>
-            </td>
-            <td className="r nar strong">{r.text}</td>
-            <td className="r nar muted">{r.goalText}</td>
-            <td className="prog">
-              <span className="repbar">
-                <span className={r.tone} style={{ width: Math.max(0, Math.min(100, r.pct)).toFixed(1) + "%" }} />
-              </span>
-            </td>
-            <td className="r nar"><Pill tone={r.tone}>{Math.round(r.pct)}%</Pill></td>
-          </tr>
+          <div className={"card " + r.tone} key={r.label}>
+            <div className="card-k">{r.label}</div>
+            <div className="card-v">{r.text}</div>
+            <div className="card-g">of {r.goalText}</div>
+            <div className="card-bar">
+              <span className={r.tone} style={{ width: Math.max(0, Math.min(100, r.pct)).toFixed(1) + "%" }} />
+            </div>
+            <div className="card-f">
+              <span className="card-pct">{Math.round(r.pct)}%</span>
+              <span className="card-n">{r.note}</span>
+            </div>
+          </div>
         ))}
-      </tbody>
-    </table>
+      </div>
     </>
   );
 }
@@ -1542,116 +1526,99 @@ function RepView({ ctx, rep }) {
         ) : null}
       </Section>
 
-      {!status.done ? (
-        <div className="nudge">
-          <div className="nudge-t">This week&rsquo;s update isn&rsquo;t done</div>
-          <ol className="nudge-list">
-            <li className={status.commitsDone ? "ok" : ""}>
-              {status.commitsDone
-                ? "Last week's deals are all answered"
-                : "Answer last week's " + status.openOld + " deal" + (status.openOld === 1 ? "" : "s") +
-                  " \u2014 " + fmtMoney(status.openOldGpv)}
-            </li>
-            <li className={status.figuresDone ? "ok" : ""}>
-              {status.figuresDone
-                ? "All " + status.ofStages + " stages checked and ticked"
-                : "Check each stage against the Salesforce report and tick it \u2014 " +
-                  status.confirmed + " of " + status.ofStages + " done"}
-            </li>
-          </ol>
-          {!status.figuresDone ? (
-            <button className="btn" onClick={() => actions.confirmAllStages(rep.id)}>
-              Tick all {status.ofStages} stages as checked
-            </button>
-          ) : null}
-        </div>
-      ) : (
-        <div className="nudge done">
-          <div className="nudge-t">{"\u2713"} Checked in for the week of {shortDate(monday)}</div>
-        </div>
-      )}
+      <Section n={secN()} title="Your week"
+        hint={status.done
+          ? "everything answered and ticked for the week of " + shortDate(monday)
+          : (carried.length ? carried.length + " to answer from last week \u00b7 " : "") +
+            status.confirmed + " of " + status.ofStages + " stages ticked"}
+        tone={status.done ? "good" : "warn"}>
 
-      {autoClosed.length ? (
-        <Section n={secN()} title="Closed automatically"
-          hint={autoClosed.length + " commitment" + (autoClosed.length === 1 ? "" : "s") +
-                " went unanswered for " + AUTO_MISS_WEEKS + " weeks and were recorded as missed. Reopen any that did move."}
-          tone="warn" open={false}>
-          <div className="review">
-            {autoClosed.map((c) => (
-              <div className="rev" key={c.id}>
-                <span className="rev-main">
-                  <span className="rev-name">{c.name || <span className="faint">unnamed</span>}</span>
-                  <span className="rev-sub">
-                    {ctx.stageName(c.fromStage)} {"\u2192"} {ctx.stageName(c.toStage)} &middot; committed {shortDate(c.weekOf)}
+        {carried.length ? (
+          <div className="grp">
+            <div className="grp-h">
+              <span className="grp-t">Still to answer from last week</span>
+              <span className="grp-n tone-bad">{fmtMoney(carried.reduce((a, c) => a + (Number(c.gpv) || 0), 0))}</span>
+            </div>
+            <div className="deals">
+              {carried.map((c) => (
+                <div className="deal" key={c.id}>
+                  <span className="deal-main">
+                    <span className="deal-name">{c.name || <span className="faint">unnamed deal</span>}</span>
+                    <span className="deal-move">
+                      {ctx.stageName(c.fromStage)} {"\u2192"} {ctx.stageName(c.toStage)}
+                      {" \u00b7 "}{shortDate(c.weekOf)}
+                    </span>
                   </span>
-                </span>
-                <span className="rev-gpv">{fmtMoney(c.gpv)}</span>
-                <span className="acts">
-                  <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>It did move</button>
-                  <button className="btn x" onClick={() => actions.reopenCommit(c.id)}>Reopen</button>
-                </span>
-              </div>
-            ))}
-          </div>
-        </Section>
-      ) : null}
-
-      {carried.length ? (
-        <Section n={secN()} title="Last week, how did it go?"
-          hint={carried.length + " commitment" + (carried.length === 1 ? "" : "s") + " still open \u2014 " +
-                fmtMoney(carried.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " \u2014 clear these first"}
-          tone="warn">
-          <div className="review">
-            {carried.map((c) => (
-              <div className="rev" key={c.id}>
-                <span className="rev-main">
-                  <span className="rev-name">{c.name || <span className="faint">unnamed</span>}</span>
-                  <span className="rev-sub">
-                    {ctx.stageName(c.fromStage)} {"\u2192"} {ctx.stageName(c.toStage)}
-                    {" \u00b7 committed "}{shortDate(c.weekOf)}
-                    {weeksBetween(c.weekOf, monday) > 1 ? " \u00b7 " + weeksBetween(c.weekOf, monday) + " weeks ago" : ""}
+                  <span className="deal-gpv">{fmtMoney(c.gpv)}</span>
+                  <span className="acts">
+                    <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>Moved</button>
+                    <button className="btn no" onClick={() => actions.resolveCommit(c.id, "missed")}>Missed</button>
+                    <button className="btn kill" onClick={() => actions.resolveCommit(c.id, "dead")}>Dead</button>
+                    <button className="btn" onClick={() => actions.rollCommit(c.id)}>Roll over</button>
                   </span>
-                </span>
-                <span className="rev-gpv">{fmtMoney(c.gpv)}</span>
-                <span className="acts">
-                  <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>Moved</button>
-                  <button className="btn no" onClick={() => actions.resolveCommit(c.id, "missed")}>Missed</button>
-                  <button className="btn kill" onClick={() => actions.resolveCommit(c.id, "dead")}>Dead</button>
-                  <button className="btn" onClick={() => actions.rollCommit(c.id)}>Roll to this week</button>
-                </span>
-              </div>
-            ))}
+                </div>
+              ))}
+            </div>
           </div>
-          <p className="faint" style={{ fontSize: "12.5px", marginTop: "14px", fontWeight: 600 }}>
-            Whatever you pick lands in the week it was committed, not today, so last week&rsquo;s numbers stay
-            true. Rolling one over records it as missed then and re-commits it for this week.
-          </p>
-        </Section>
-      ) : null}
+        ) : null}
 
-      <Section n={secN()} title="This week&rsquo;s deals"
-        hint={weekDeals.length
-          ? weekDeals.filter((c) => c.status === "moved").length + " of " + weekDeals.length + " moved \u00b7 " +
-            fmtMoney(weekDeals.filter((c) => c.status === "moved").reduce((a, c) => a + (Number(c.gpv) || 0), 0)) +
-            " of " + fmtMoney(weekDeals.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " named"
-          : "nothing named yet \u2014 add them from the funnel below"}
-        tone={weekDeals.length === 0 ? "warn" : (weekDeals.every((c) => c.status !== "open") ? "good" : undefined)}>
-        {weekDeals.length ? (
-          <div className="deals">
-            {weekDeals.map((c) => (
-              <DealRow key={c.id} commit={c} stageName={ctx.stageName} actions={actions} />
-            ))}
+        <div className="grp">
+          <div className="grp-h">
+            <span className="grp-t">This week&rsquo;s deals</span>
+            <span className={"grp-n tone-" + tone(flow.named, flow.need)}>
+              {fmtMoney(flow.named)} of {fmtMoney(flow.need)}
+            </span>
           </div>
-        ) : (
-          <div className="deal-empty">
-            No deals named for the week of {shortDate(monday)}. Open a stage below and use
-            &ldquo;Move a deal out of&hellip;&rdquo; to name one.
+          {weekDeals.length ? (
+            <div className="deals">
+              {weekDeals.map((c) => (
+                <DealRow key={c.id} commit={c} stageName={ctx.stageName} actions={actions} />
+              ))}
+            </div>
+          ) : (
+            <div className="deal-empty">
+              Nothing named yet. Open a stage below and use &ldquo;Move a deal out of&hellip;&rdquo;.
+            </div>
+          )}
+        </div>
+
+        {!status.figuresDone ? (
+          <div className="grp">
+            <div className="grp-h">
+              <span className="grp-t">Stages still to tick</span>
+              <span className="grp-n tone-warn">{status.confirmed} of {status.ofStages}</span>
+            </div>
+            <p className="deal-empty" style={{ paddingTop: "8px" }}>
+              Check each stage against the report below and tick it off.
+              <button className="btn" style={{ marginLeft: "12px" }}
+                onClick={() => actions.confirmAllStages(rep.id)}>
+                Tick all {status.ofStages}
+              </button>
+            </p>
           </div>
-        )}
-        {weekDeals.length ? (
-          <div className="deal-sum">
-            <span>{fmtMoney(flow.named)} of {fmtMoney(flow.need)} needed this week</span>
-            <span>{weekDeals.filter((c) => c.status === "open").length} still to resolve</span>
+        ) : null}
+
+        {autoClosed.length ? (
+          <div className="grp">
+            <div className="grp-h">
+              <span className="grp-t">Closed automatically</span>
+              <span className="grp-n tone-warn">{autoClosed.length}</span>
+            </div>
+            <div className="deals">
+              {autoClosed.map((c) => (
+                <div className="deal done" key={c.id}>
+                  <span className="deal-main">
+                    <span className="deal-name">{c.name || <span className="faint">unnamed deal</span>}</span>
+                    <span className="deal-move">unanswered for {AUTO_MISS_WEEKS} weeks &middot; recorded as missed</span>
+                  </span>
+                  <span className="deal-gpv">{fmtMoney(c.gpv)}</span>
+                  <span className="acts">
+                    <button className="btn ok" onClick={() => actions.resolveCommit(c.id, "moved")}>It moved</button>
+                    <button className="btn x" onClick={() => actions.reopenCommit(c.id)}>Reopen</button>
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
         ) : null}
       </Section>
@@ -2373,7 +2340,7 @@ export default function App() {
     addCommitOutOf(repId, stageId) {
       update((d) => {
         const i = d.config.stages.findIndex((s) => s.id === stageId);
-        const to = i >= 0 && i < d.config.stages.length - 1 ? d.config.stages[i + 1].id : "";
+        const to = i >= 0 && i < d.config.stages.length - 1 ? d.config.stages[i + 1].id : ACTIVE_STAGE;
         d.commits.push({
           id: uid("cmt"), repId, name: "", gpv: 0, fromStage: stageId, toStage: to,
           weekOf: thisMonday(), status: "open", resolvedWeek: null, createdAt: Date.now()
@@ -2479,6 +2446,7 @@ export default function App() {
   const ids = reps.map((r) => r.id);
   const baseline = pickBaseline(data.snapshots, monday);
   const stageName = (id) => {
+    if (id === ACTIVE_STAGE) return ACTIVE_NAME;
     const s = stages.find((x) => x.id === id);
     return s ? s.name : "\u2014";
   };
@@ -2832,6 +2800,33 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .nudge-list li{margin:4px 0}
 .nudge-list li.ok{color:var(--good);font-weight:600}
 .nudge-list li.ok::marker{content:"\\2713  "}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(196px,1fr));gap:14px}
+.card{border-radius:var(--r-sm);padding:16px 17px 15px;border:1.5px solid var(--line)}
+.card.good{background:var(--good-bg);border-color:#CDEDE1}
+.card.warn{background:var(--warn-bg);border-color:#F0D9A8}
+.card.bad{background:var(--bad-bg);border-color:#F3CFCB}
+.card-k{font-size:12px;font-weight:750;letter-spacing:.01em;color:var(--slate);text-transform:uppercase}
+.card-v{font-size:26px;font-weight:800;letter-spacing:-.03em;margin-top:8px;line-height:1.05}
+.card.good .card-v{color:var(--good)}
+.card.warn .card-v{color:var(--warn)}
+.card.bad .card-v{color:var(--bad)}
+.card-g{font-size:12.5px;font-weight:650;color:var(--slate);margin-top:3px}
+.card-bar{position:relative;height:6px;border-radius:999px;background:rgba(27,35,51,.09);margin-top:12px;overflow:hidden}
+.card-bar span{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
+.card-bar span.warn{background:var(--warn-bar)}
+.card-bar span.bad{background:var(--bad-bar)}
+.card-f{display:flex;align-items:baseline;gap:8px;margin-top:9px}
+.card-pct{font-size:13px;font-weight:800}
+.card.good .card-pct{color:var(--good)}
+.card.warn .card-pct{color:var(--warn)}
+.card.bad .card-pct{color:var(--bad)}
+.card-n{font-size:11.5px;color:var(--faint);font-weight:600}
+@media (max-width:620px){.cards{grid-template-columns:1fr 1fr;gap:10px}.card-v{font-size:21px}}
+.grp{padding:2px 0 4px}
+.grp + .grp{margin-top:22px;border-top:1px solid var(--line);padding-top:18px}
+.grp-h{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:4px}
+.grp-t{font-size:13px;font-weight:750;letter-spacing:-.01em}
+.grp-n{font-size:13px;font-weight:800;white-space:nowrap}
 .deals{display:flex;flex-direction:column}
 .deal{display:grid;grid-template-columns:1fr 104px auto;gap:14px;align-items:center;padding:13px 0;border-bottom:1px solid var(--line)}
 .deal:last-child{border-bottom:0}
