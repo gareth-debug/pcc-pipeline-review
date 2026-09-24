@@ -1507,7 +1507,7 @@ function RepView({ ctx, rep }) {
   const card = scorecard(data, [rep.id], monday);
   const secN = makeCounter();
   const status = repWeekStatus(data, rep.id, monday);
-  const mine = commitsThisWeek(data, [rep.id], monday);
+  const weekDeals = commitsThisWeek(data, [rep.id], monday);
   const carried = unresolvedBefore(data, [rep.id], monday)
     .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
   /* only worth showing while it is still recent enough to argue with */
@@ -1630,15 +1630,15 @@ function RepView({ ctx, rep }) {
       ) : null}
 
       <Section n={secN()} title="This week&rsquo;s deals"
-        hint={mine.length
-          ? mine.filter((c) => c.status === "moved").length + " of " + mine.length + " moved \u00b7 " +
-            fmtMoney(mine.filter((c) => c.status === "moved").reduce((a, c) => a + (Number(c.gpv) || 0), 0)) +
-            " of " + fmtMoney(mine.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " named"
+        hint={weekDeals.length
+          ? weekDeals.filter((c) => c.status === "moved").length + " of " + weekDeals.length + " moved \u00b7 " +
+            fmtMoney(weekDeals.filter((c) => c.status === "moved").reduce((a, c) => a + (Number(c.gpv) || 0), 0)) +
+            " of " + fmtMoney(weekDeals.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " named"
           : "nothing named yet \u2014 add them from the funnel below"}
-        tone={mine.length === 0 ? "warn" : (mine.every((c) => c.status !== "open") ? "good" : undefined)}>
-        {mine.length ? (
+        tone={weekDeals.length === 0 ? "warn" : (weekDeals.every((c) => c.status !== "open") ? "good" : undefined)}>
+        {weekDeals.length ? (
           <div className="deals">
-            {mine.map((c) => (
+            {weekDeals.map((c) => (
               <DealRow key={c.id} commit={c} stageName={ctx.stageName} actions={actions} />
             ))}
           </div>
@@ -1648,10 +1648,10 @@ function RepView({ ctx, rep }) {
             &ldquo;Move a deal out of&hellip;&rdquo; to name one.
           </div>
         )}
-        {mine.length ? (
+        {weekDeals.length ? (
           <div className="deal-sum">
             <span>{fmtMoney(flow.named)} of {fmtMoney(flow.need)} needed this week</span>
-            <span>{mine.filter((c) => c.status === "open").length} still to resolve</span>
+            <span>{weekDeals.filter((c) => c.status === "open").length} still to resolve</span>
           </div>
         ) : null}
       </Section>
