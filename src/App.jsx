@@ -9,10 +9,10 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 20;
+const DATA_VERSION = 21;
 /* Bumped by hand on every file I send, and shown in the header, so "did the
    upload land?" is answerable at a glance instead of by hunting for a feature. */
-const BUILD = "20";
+const BUILD = "21";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -2482,7 +2482,13 @@ export default function App() {
     const s = stages.find((x) => x.id === id);
     return s ? s.name : "\u2014";
   };
-  const ctx = { data, stages, ids, monday, baseline, actions, onEditing, setTab, showMatrix, stageName };
+  /* Looks across all reps, not just active ones, so a deal belonging to someone
+     who has been deactivated still shows a name rather than blanking. */
+  const repName = (id) => {
+    const r = data.config.reps.find((x) => x.id === id);
+    return r ? r.name : "\u2014";
+  };
+  const ctx = { data, stages, ids, monday, baseline, actions, onEditing, setTab, showMatrix, stageName, repName };
   const currentRep = data.config.reps.find((r) => r.id === tab);
 
   return (
