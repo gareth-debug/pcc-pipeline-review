@@ -9,10 +9,10 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 19;
+const DATA_VERSION = 20;
 /* Bumped by hand on every file I send, and shown in the header, so "did the
    upload land?" is answerable at a glance instead of by hunting for a feature. */
-const BUILD = "19";
+const BUILD = "20";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -581,6 +581,17 @@ function repWeekStatus(d, repId, mondayIso) {
   };
 }
 
+/* Everything committed for this week, resolved or not, ordered down the funnel
+   so the list reads the way the conversation runs. */
+function commitsThisWeek(d, repIds, mondayIso) {
+  const order = {};
+  d.config.stages.forEach((st, i) => { order[st.id] = i; });
+  const rank = (c) => (order[c.fromStage] === undefined ? 99 : order[c.fromStage]);
+  return d.commits
+    .filter((c) => c.weekOf === mondayIso && repIds.indexOf(c.repId) >= 0)
+    .sort((a, b) => rank(a) - rank(b) || (Number(b.gpv) || 0) - (Number(a.gpv) || 0));
+}
+
 /* Commitments made before this week that were never resolved. These are the
    first thing a 1:1 deals with, and until they are cleared the weekly figures
    cannot be trusted. */
@@ -1003,6 +1014,40 @@ function MoveWorking({ data, repIds, monday }) {
    sections appear and disappear conditionally and hand-numbering drifts. */
 function makeCounter() { let i = 0; return () => String(++i); }
 
+/* A committed deal with its three outcomes one tap away. Used on the rep tab
+   and on Master, so a deal can be marked off wherever it is being discussed. */
+function DealRow({ commit, stageName, repLabel, actions }) {
+  const done = commit.status !== "open";
+  return (
+    <div className={"deal" + (done ? " done" : "")}>
+      <span className="deal-main">
+        <span className="deal-name">
+          {commit.name || <span className="faint">unnamed deal</span>}
+          {repLabel ? <span className="deal-rep">{repLabel}</span> : null}
+        </span>
+        <span className="deal-move">
+          {stageName(commit.fromStage)} {"\u2192"} {stageName(commit.toStage)}
+        </span>
+      </span>
+      <span className="deal-gpv">{fmtMoney(commit.gpv)}</span>
+      <span className="acts">
+        {done ? (
+          <>
+            <span className={"tag " + commit.status}>{commit.status}</span>
+            <button className="btn x" onClick={() => actions.reopenCommit(commit.id)}>undo</button>
+          </>
+        ) : (
+          <>
+            <button className="btn ok" onClick={() => actions.resolveCommit(commit.id, "moved")}>Moved</button>
+            <button className="btn no" onClick={() => actions.resolveCommit(commit.id, "missed")}>Missed</button>
+            <button className="btn kill" onClick={() => actions.resolveCommit(commit.id, "dead")}>Dead</button>
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
 function Section({ n, title, hint, action, tone: t, children, open: openDefault }) {
   const [open, setOpen] = useState(openDefault !== false);
   return (
@@ -1114,6 +1159,7 @@ function MasterView({ ctx }) {
   const newPipe = newPipelineEstimate(data, ids, monday);
   const card = scorecard(data, ids, monday);
   const secN = makeCounter();
+  const teamDeals = commitsThisWeek(data, ids, monday);
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -1242,6 +1288,26 @@ function MasterView({ ctx }) {
             })}
           </tbody>
         </table>
+      </Section>
+
+      <Section n={secN()} title="Every deal on the table"
+        hint={teamDeals.length
+          ? teamDeals.filter((c) => c.status === "moved").length + " of " + teamDeals.length +
+            " moved \u00b7 " + fmtMoney(teamDeals.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " named across the team"
+          : "nothing named by anyone yet this week"}
+        tone={teamDeals.length === 0 ? "bad" : undefined}>
+        {teamDeals.length ? (
+          <div className="deals">
+            {teamDeals.map((c) => (
+              <DealRow key={c.id} commit={c} stageName={ctx.stageName}
+                repLabel={shortName(ctx.repName(c.repId))} actions={actions} />
+            ))}
+          </div>
+        ) : (
+          <div className="deal-empty">
+            No deals named for the week of {shortDate(monday)}. They appear here as reps name them.
+          </div>
+        )}
       </Section>
 
       <Section n={secN()} title="The funnel" hint="bar is what is held, the pill is what is moving out this week">
@@ -1441,6 +1507,7 @@ function RepView({ ctx, rep }) {
   const card = scorecard(data, [rep.id], monday);
   const secN = makeCounter();
   const status = repWeekStatus(data, rep.id, monday);
+  const mine = commitsThisWeek(data, [rep.id], monday);
   const carried = unresolvedBefore(data, [rep.id], monday)
     .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
   /* only worth showing while it is still recent enough to argue with */
@@ -1561,6 +1628,33 @@ function RepView({ ctx, rep }) {
           </p>
         </Section>
       ) : null}
+
+      <Section n={secN()} title="This week&rsquo;s deals"
+        hint={mine.length
+          ? mine.filter((c) => c.status === "moved").length + " of " + mine.length + " moved \u00b7 " +
+            fmtMoney(mine.filter((c) => c.status === "moved").reduce((a, c) => a + (Number(c.gpv) || 0), 0)) +
+            " of " + fmtMoney(mine.reduce((a, c) => a + (Number(c.gpv) || 0), 0)) + " named"
+          : "nothing named yet \u2014 add them from the funnel below"}
+        tone={mine.length === 0 ? "warn" : (mine.every((c) => c.status !== "open") ? "good" : undefined)}>
+        {mine.length ? (
+          <div className="deals">
+            {mine.map((c) => (
+              <DealRow key={c.id} commit={c} stageName={ctx.stageName} actions={actions} />
+            ))}
+          </div>
+        ) : (
+          <div className="deal-empty">
+            No deals named for the week of {shortDate(monday)}. Open a stage below and use
+            &ldquo;Move a deal out of&hellip;&rdquo; to name one.
+          </div>
+        )}
+        {mine.length ? (
+          <div className="deal-sum">
+            <span>{fmtMoney(flow.named)} of {fmtMoney(flow.need)} needed this week</span>
+            <span>{mine.filter((c) => c.status === "open").length} still to resolve</span>
+          </div>
+        ) : null}
+      </Section>
 
       <Section n={secN()} title="Walk the funnel"
         hint={flow.need - flow.named > 0
@@ -2732,6 +2826,17 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .nudge-list li{margin:4px 0}
 .nudge-list li.ok{color:var(--good);font-weight:600}
 .nudge-list li.ok::marker{content:"\\2713  "}
+.deals{display:flex;flex-direction:column}
+.deal{display:grid;grid-template-columns:1fr 104px auto;gap:14px;align-items:center;padding:13px 0;border-bottom:1px solid var(--line)}
+.deal:last-child{border-bottom:0}
+.deal.done{opacity:.55}
+.deal-main{display:flex;flex-direction:column;gap:3px;min-width:0}
+.deal-name{font-size:14.5px;font-weight:650;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.deal-rep{font-size:11px;font-weight:700;color:var(--slate);background:var(--paper);padding:2px 8px;border-radius:999px}
+.deal-move{font-size:12.5px;color:var(--faint);font-weight:600}
+.deal-gpv{text-align:right;font-size:15px;font-weight:700}
+.deal-empty{padding:16px 0;color:var(--faint);font-size:13.5px;font-weight:500}
+.deal-sum{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-size:12.5px;font-weight:700;color:var(--slate)}
 .review{display:flex;flex-direction:column;gap:2px}
 .rev{display:grid;grid-template-columns:1fr 96px auto;gap:14px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
 .rev:last-child{border-bottom:0}
