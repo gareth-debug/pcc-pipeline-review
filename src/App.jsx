@@ -12,7 +12,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 const DATA_VERSION = 22;
 /* Bumped by hand on every file I send, and shown in the header, so "did the
    upload land?" is answerable at a glance instead of by hunting for a feature. */
-const BUILD = "22";
+const BUILD = "23";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -600,6 +600,35 @@ function commitsThisWeek(d, repIds, mondayIso) {
     .sort((a, b) => rank(a) - rank(b) || (Number(b.gpv) || 0) - (Number(a.gpv) || 0));
 }
 
+/* How a week actually went. The distinction that matters on a Monday is
+   between a deal that was answered and missed, and one nobody ever answered:
+   the first is a forecast that did not land, the second is a process failure,
+   and they need different conversations. */
+function weekReview(d, repIds, weekIso) {
+  const rows = d.commits.filter((c) => c.weekOf === weekIso && repIds.indexOf(c.repId) >= 0);
+  const sum = (a) => a.reduce((x, c) => x + (Number(c.gpv) || 0), 0);
+  const moved = rows.filter((c) => c.status === "moved");
+  const dead = rows.filter((c) => c.status === "dead");
+  /* never answered: auto-closed by the sweep, or still sitting open */
+  const unlogged = rows.filter((c) => c.autoMissed || c.status === "open");
+  const missed = rows.filter((c) => c.status === "missed" && !c.autoMissed);
+  const answered = moved.length + missed.length;
+  return {
+    week: weekIso,
+    committed: rows.length, committedGpv: sum(rows),
+    moved: moved.length, movedGpv: sum(moved),
+    missed: missed.length, missedGpv: sum(missed),
+    dead: dead.length, deadGpv: sum(dead),
+    unlogged: unlogged.length, unloggedGpv: sum(unlogged),
+    hitRate: answered > 0 ? moved.length / answered : null,
+    anything: rows.length > 0
+  };
+}
+
+function lastMondayOf(mondayIso) {
+  return isoDate(new Date(new Date(mondayIso + "T00:00:00").getTime() - 7 * 864e5));
+}
+
 /* Commitments made before this week that were never resolved. These are the
    first thing a 1:1 deals with, and until they are cleared the weekly figures
    cannot be trusted. */
@@ -1066,6 +1095,32 @@ function Section({ n, title, hint, action, tone: t, children, open: openDefault 
   );
 }
 
+/* Four facts about a finished week, colour-led so the shape reads before the
+   numbers do. */
+function WeekBlocks({ rev, label }) {
+  if (!rev.anything) {
+    return <div className="deal-empty">Nothing was committed for {label}, so there is nothing to score.</div>;
+  }
+  const cells = [
+    { k: "Moved", v: fmtMoney(rev.movedGpv), n: rev.moved + " of " + rev.committed + " deals", tone: "good" },
+    { k: "Missed", v: fmtMoney(rev.missedGpv), n: rev.missed + " answered, did not move", tone: rev.missed ? "warn" : "flat" },
+    { k: "Not logged", v: fmtMoney(rev.unloggedGpv), n: rev.unlogged + " never answered", tone: rev.unlogged ? "bad" : "flat" },
+    { k: "Hit rate", v: rev.hitRate === null ? "\u2014" : Math.round(rev.hitRate * 100) + "%",
+      n: "of what was answered", tone: rev.hitRate === null ? "flat" : tone(rev.hitRate, 0.8) }
+  ];
+  return (
+    <div className="cards">
+      {cells.map((c) => (
+        <div className={"card " + c.tone} key={c.k}>
+          <div className="card-k">{c.k}</div>
+          <div className="card-v">{c.v}</div>
+          <div className="card-f"><span className="card-n">{c.n}</span></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Scorecard({ rows }) {
   const partial = rows.of > 1 && rows.reporting < rows.of;
   return (
@@ -1144,6 +1199,11 @@ function MasterView({ ctx }) {
   const card = scorecard(data, ids, monday);
   const secN = makeCounter();
   const teamDeals = commitsThisWeek(data, ids, monday);
+  const lastWk = lastMondayOf(monday);
+  const teamLast = weekReview(data, ids, lastWk);
+  const notDone = activeRepsOf(data).filter((r) =>
+    !repWeekStatus(data, r.id, monday).done || commitsThisWeek(data, [r.id], monday).length === 0);
+  const allDone = notDone.length === 0;
 
   const caps = weeklyCaptures(data.snapshots).slice(-8);
   const trend = {};
@@ -1155,72 +1215,58 @@ function MasterView({ ctx }) {
 
   return (
     <>
-      <Section n={secN()} title="Where we are against goal"
-        hint="everything the model asks for, in one place"
-        tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
-        <Scorecard rows={card} />
+      <Section n={secN()} title={"Last week \u2014 " + shortDate(lastWk)}
+        hint={teamLast.anything
+          ? teamLast.moved + " of " + teamLast.committed + " deals moved" +
+            (teamLast.unlogged ? " \u00b7 " + teamLast.unlogged + " never answered" : "")
+          : "nothing was committed"}
+        tone={!teamLast.anything ? "flat" : (teamLast.unlogged ? "bad" : tone(teamLast.hitRate || 0, 0.8))}>
+        <WeekBlocks rev={teamLast} label={"the week of " + shortDate(lastWk)} />
       </Section>
 
-      <Section n={secN()} title="Pipeline runway"
-        hint="how long the book lasts, and what it is worth"
-        tone={coverTone}>
-        <div className="headline-row">
-          <Gauge pct={Math.min(coverPct, 999)} tone={coverTone} />
-          <div style={{ maxWidth: "560px" }}>
-            <div className="hero-v">{cover.months.toFixed(1)} <span style={{ fontSize: "22px", fontWeight: 700 }}>months</span></div>
-            <div className="hero-s">
-              At {fmtMoney(ACTIVATION_PER_MONTH * ids.length)} a month, everything the team is working today
-              covers <b>{cover.months.toFixed(1)} months</b> of activation before it runs dry.
-              A healthy book covers <b>{tgt.months.toFixed(1)}</b>.
-              <CoverWorking data={data} repIds={ids} />
-            </div>
-          </div>
-        </div>
-        {newPipe ? (
-          <div className="calc" style={{ marginTop: "16px", maxWidth: "none" }}>
-            <span className="calc-part"><b>Discovery now</b> {fmtMoney(newPipe.now)}</span>
-            <span className="calc-part"><b>was</b> {fmtMoney(newPipe.then)}</span>
-            <span className="calc-part"><b>moved on</b> {fmtMoney(newPipe.movedOut)}</span>
-            <span className="calc-part"><b>killed</b> {fmtMoney(newPipe.killed)}</span>
-            <span className="calc-total">so {fmtMoney(newPipe.added)} of new pipeline built</span>
-          </div>
-        ) : null}
-      </Section>
-
-      <Section n={secN()} title="Weekly check-in"
-        hint={"who has been through their stages for the week of " + shortDate(monday)}
-        tone={activeRepsOf(data).every((r) => repWeekStatus(data, r.id, monday).done) ? "good" : "warn"}>
+      <Section n={secN()} title="This week"
+        hint={allDone
+          ? "everyone has checked in and named their deals"
+          : notDone.length + " of " + activeRepsOf(data).length + " reps still to finish"}
+        tone={allDone ? "good" : "warn"}>
         <table className="tbl">
           <thead>
             <tr>
               <th>Rep</th>
+              <th className="r nar">Last week</th>
               <th className="r nar">Stages ticked</th>
-              <th className="r nar">Last week&rsquo;s deals</th>
+              <th className="r nar">Deals named</th>
               <th className="r nar">Status</th>
-              <th className="r nar" />
             </tr>
           </thead>
           <tbody>
             {activeRepsOf(data).map((r) => {
               const w = repWeekStatus(data, r.id, monday);
+              const lw = weekReview(data, [r.id], lastWk);
+              const fl = flowOf(data, [r.id], monday);
+              const named = commitsThisWeek(data, [r.id], monday).length;
               return (
                 <tr key={r.id}>
                   <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
+                  <td className="r nar">
+                    {lw.anything
+                      ? <Pill tone={lw.unlogged ? "bad" : tone(lw.hitRate || 0, 0.8)}>
+                          {lw.moved}/{lw.committed} moved
+                        </Pill>
+                      : <span className="faint">none</span>}
+                  </td>
                   <td className="r nar">
                     <Pill tone={w.figuresDone ? "good" : (w.confirmed > 0 ? "warn" : "bad")}>
                       {w.confirmed} of {w.ofStages}
                     </Pill>
                   </td>
                   <td className="r nar">
-                    {w.commitsDone
-                      ? <Pill tone="good">answered</Pill>
-                      : <Pill tone="bad">{w.openOld} open &middot; {fmtMoney(w.openOldGpv)}</Pill>}
+                    {named
+                      ? <Pill tone={tone(fl.named, fl.need)}>{named} &middot; {fmtMoney(fl.named)}</Pill>
+                      : <Pill tone="bad">none yet</Pill>}
                   </td>
                   <td className="r nar">
-                    {w.done ? <Pill tone="good">done</Pill> : <Pill tone="warn">outstanding</Pill>}
-                  </td>
-                  <td className="r nar">
-                    {w.done ? null : <button className="btn" onClick={() => setTab(r.id)}>Open</button>}
+                    {w.done && named ? <Pill tone="good">ready</Pill> : <button className="btn" onClick={() => setTab(r.id)}>Chase</button>}
                   </td>
                 </tr>
               );
@@ -1229,50 +1275,15 @@ function MasterView({ ctx }) {
         </table>
       </Section>
 
-      <Section n={secN()} title="Deals named to move"
-        hint={fmtMoney(flow.named) + " of " + fmtMoney(flow.need) + " named across the team this week"}
-        tone={tone(flow.named, flow.need)}>
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>Rep</th>
-              <th className="r nar">Named</th>
-              <th className="r nar">Needed</th>
-              <th className="prog">Progress</th>
-              <th className="r nar">Deals</th>
-              <th className="r nar">Biggest gap</th>
-            </tr>
-          </thead>
-          <tbody>
-            {activeRepsOf(data).map((r) => {
-              const fl = flowOf(data, [r.id], monday);
-              const named = data.commits.filter((c) => c.repId === r.id && c.weekOf === monday).length;
-              let worst = null;
-              stages.forEach((st, i) => {
-                const sf = stageFlow(data, r.id, i);
-                if (sf.outShort > 0 && (!worst || sf.outShort > worst.short)) {
-                  worst = { name: st.name, short: sf.outShort };
-                }
-              });
-              const t2 = tone(fl.named, fl.need);
-              return (
-                <tr key={r.id}>
-                  <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
-                  <td className="r nar strong">{fmtMoney(fl.named)}</td>
-                  <td className="r nar muted">{fmtMoney(fl.need)}</td>
-                  <td className="prog">
-                    <span className="repbar"><span className={t2} style={{ width: Math.min(100, fl.need > 0 ? (fl.named / fl.need) * 100 : 0).toFixed(1) + "%" }} /></span>
-                  </td>
-                  <td className="r nar">{named ? named : <span className="faint">none</span>}</td>
-                  <td className="r nar">
-                    {worst ? <Pill tone="warn">{worst.name} {fmtMoney(worst.short)}</Pill> : <Pill tone="good">covered</Pill>}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <Section n={secN()} title="Pipeline position" open={false}
+        hint="the model targets, and how the book sits against them">
+        <Scorecard rows={card} />
+        <div style={{ marginTop: "18px" }}>
+          <CoverWorking data={data} repIds={ids} />
+        </div>
       </Section>
+
+
 
       <Section n={secN()} title="Every deal on the table"
         hint={teamDeals.length
@@ -1492,6 +1503,8 @@ function RepView({ ctx, rep }) {
   const secN = makeCounter();
   const status = repWeekStatus(data, rep.id, monday);
   const weekDeals = commitsThisWeek(data, [rep.id], monday);
+  const lastWk = lastMondayOf(monday);
+  const myLast = weekReview(data, [rep.id], lastWk);
   const carried = unresolvedBefore(data, [rep.id], monday)
     .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
   /* only worth showing while it is still recent enough to argue with */
@@ -1511,19 +1524,13 @@ function RepView({ ctx, rep }) {
 
   return (
     <>
-      <Section n={secN()} title={rep.name + " against goal"}
-        hint="the same measures as the team view, scored for one book"
-        tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
-        <Scorecard rows={card} />
-        <div style={{ marginTop: "14px" }}>
-          <CoverWorking data={data} repIds={[rep.id]} />
-        </div>
-        {repPipe ? (
-          <p className="faint" style={{ fontSize: "12.5px", marginTop: "10px", fontWeight: 600 }}>
-            New pipeline worked out from Discovery: {fmtMoney(repPipe.now)} there now, {fmtMoney(repPipe.then)} on{" "}
-            {shortDate(repPipe.since)}, {fmtMoney(repPipe.movedOut)} moved on, {fmtMoney(repPipe.killed)} killed.
-          </p>
-        ) : null}
+      <Section n={secN()} title={"Last week \u2014 " + shortDate(lastWk)}
+        hint={myLast.anything
+          ? myLast.moved + " of " + myLast.committed + " deals moved" +
+            (myLast.unlogged ? " \u00b7 " + myLast.unlogged + " never answered" : "")
+          : "nothing was committed"}
+        tone={!myLast.anything ? "flat" : (myLast.unlogged ? "bad" : tone(myLast.hitRate || 0, 0.8))}>
+        <WeekBlocks rev={myLast} label={"the week of " + shortDate(lastWk)} />
       </Section>
 
       <Section n={secN()} title="Your week"
@@ -1620,6 +1627,21 @@ function RepView({ ctx, rep }) {
               ))}
             </div>
           </div>
+        ) : null}
+      </Section>
+
+      <Section n={secN()} title="Pipeline position" open={false}
+        hint="the model targets, and how this book sits against them"
+        tone={card.filter((r) => r.tone === "bad").length > 2 ? "bad" : "good"}>
+        <Scorecard rows={card} />
+        <div style={{ marginTop: "18px" }}>
+          <CoverWorking data={data} repIds={[rep.id]} />
+        </div>
+        {repPipe ? (
+          <p className="faint" style={{ fontSize: "12.5px", marginTop: "10px", fontWeight: 600 }}>
+            New pipeline worked out from Discovery: {fmtMoney(repPipe.now)} there now, {fmtMoney(repPipe.then)} on{" "}
+            {shortDate(repPipe.since)}, {fmtMoney(repPipe.movedOut)} moved on, {fmtMoney(repPipe.killed)} killed.
+          </p>
         ) : null}
       </Section>
 
@@ -2805,6 +2827,8 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .card.good{background:var(--good-bg);border-color:#CDEDE1}
 .card.warn{background:var(--warn-bg);border-color:#F0D9A8}
 .card.bad{background:var(--bad-bg);border-color:#F3CFCB}
+.card.flat{background:var(--paper);border-color:var(--line)}
+.card.flat .card-v{color:var(--slate)}
 .card-k{font-size:12px;font-weight:750;letter-spacing:.01em;color:var(--slate);text-transform:uppercase}
 .card-v{font-size:26px;font-weight:800;letter-spacing:-.03em;margin-top:8px;line-height:1.05}
 .card.good .card-v{color:var(--good)}
