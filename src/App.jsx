@@ -9,10 +9,10 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
    older shapes forward, and writes it back. Redeploying never touches data.
    ========================================================================== */
 
-const DATA_VERSION = 22;
+const DATA_VERSION = 23;
 /* Bumped by hand on every file I send, and shown in the header, so "did the
    upload land?" is answerable at a glance instead of by hunting for a feature. */
-const BUILD = "26";
+const BUILD = "29";
 const SAVE_DEBOUNCE_MS = 900;
 const POLL_MS = 8000;
 const MAX_SNAPSHOTS = 260;
@@ -286,9 +286,7 @@ function dwellVerdict(stage, days) {
 function defaultReps() {
   return [
     { id: "rep_david", name: "David Agadzhanyan", active: true },
-    { id: "rep_ryan", name: "Ryan Wadhams", active: true },
     { id: "rep_aubrey", name: "Aubrey Heathcott", active: true },
-    { id: "rep_zachariah", name: "Zachariah Wichman", active: true },
     { id: "rep_tacen", name: "Tacen Woods", active: true },
     { id: "rep_wilmer", name: "Wilmer Lemus", active: true },
     { id: "rep_joey", name: "Joey Millet", active: true }
@@ -312,6 +310,7 @@ function migrate(raw) {
   const input = raw && typeof raw === "object" ? raw : {};
   const d = Object.assign({}, base, input);
 
+  const prevVersion = input && input.meta ? input.meta.version : 0;
   d.meta = Object.assign({ version: DATA_VERSION, updatedAt: Date.now() }, input.meta || {});
   d.config = Object.assign({}, base.config, input.config || {});
 
@@ -400,6 +399,16 @@ function migrate(raw) {
       floors: s.floors && typeof s.floors === "object" ? s.floors : {},
       reps: s.reps && typeof s.reps === "object" ? s.reps : {}
     }));
+
+  /* One-off: two reps left the team. Keyed to the version so it runs once and
+     does not delete anyone added later through Settings. */
+  if ((Number(prevVersion) || 0) < 23) {
+    const gone = ["rep_ryan", "rep_zachariah"];
+    d.config.reps = d.config.reps.filter((r) => gone.indexOf(r.id) < 0);
+    gone.forEach((id) => { delete d.current[id]; });
+    d.commits = d.commits.filter((c) => gone.indexOf(c.repId) < 0);
+    d.snapshots.forEach((sn) => { gone.forEach((id) => { if (sn.reps) delete sn.reps[id]; }); });
+  }
 
   d.meta.version = DATA_VERSION;
   return d;
@@ -600,33 +609,23 @@ function commitsThisWeek(d, repIds, mondayIso) {
     .sort((a, b) => rank(a) - rank(b) || (Number(b.gpv) || 0) - (Number(a.gpv) || 0));
 }
 
-/* How a week actually went. The distinction that matters on a Monday is
-   between a deal that was answered and missed, and one nobody ever answered:
-   the first is a forecast that did not land, the second is a process failure,
-   and they need different conversations. */
-function weekReview(d, repIds, weekIso) {
-  const rows = d.commits.filter((c) => c.weekOf === weekIso && repIds.indexOf(c.repId) >= 0);
-  const sum = (a) => a.reduce((x, c) => x + (Number(c.gpv) || 0), 0);
-  const moved = rows.filter((c) => c.status === "moved");
-  const dead = rows.filter((c) => c.status === "dead");
-  /* never answered: auto-closed by the sweep, or still sitting open */
-  const unlogged = rows.filter((c) => c.autoMissed || c.status === "open");
-  const missed = rows.filter((c) => c.status === "missed" && !c.autoMissed);
-  const answered = moved.length + missed.length;
-  return {
-    week: weekIso,
-    committed: rows.length, committedGpv: sum(rows),
-    moved: moved.length, movedGpv: sum(moved),
-    missed: missed.length, missedGpv: sum(missed),
-    dead: dead.length, deadGpv: sum(dead),
-    unlogged: unlogged.length, unloggedGpv: sum(unlogged),
-    hitRate: answered > 0 ? moved.length / answered : null,
-    anything: rows.length > 0
-  };
-}
 
 function lastMondayOf(mondayIso) {
   return isoDate(new Date(new Date(mondayIso + "T00:00:00").getTime() - 7 * 864e5));
+}
+
+/* What a finished week came to. Deliberately thin: chosen, hit, and anything
+   left open. Nothing else was being read. */
+function weekScore(d, repIds, weekIso) {
+  const rows = d.commits.filter((c) => c.weekOf === weekIso && repIds.indexOf(c.repId) >= 0);
+  const sum = (a) => a.reduce((x, c) => x + (Number(c.gpv) || 0), 0);
+  const hit = rows.filter((c) => c.status === "moved");
+  return {
+    chosen: rows.length, chosenGpv: sum(rows),
+    hit: hit.length, hitGpv: sum(hit),
+    open: rows.filter((c) => c.status === "open").length,
+    anything: rows.length > 0
+  };
 }
 
 /* Commitments made before this week that were never resolved. These are the
@@ -961,7 +960,12 @@ function MasterView({ ctx }) {
   const secN = makeCounter();
   const teamDeals = commitsThisWeek(data, ids, monday);
   const lastWk = lastMondayOf(monday);
-  const teamLast = weekReview(data, ids, lastWk);
+  const teamOverdue = unresolvedBefore(data, ids, monday);
+  const lastScore = weekScore(data, ids, lastWk);
+  const notReady = activeRepsOf(data).filter((r) => {
+    const fl = flowOf(data, [r.id], monday);
+    return fl.named < fl.need || unresolvedBefore(data, [r.id], monday).length > 0;
+  });
   const notDone = activeRepsOf(data).filter((r) =>
     !repWeekStatus(data, r.id, monday).done || commitsThisWeek(data, [r.id], monday).length === 0);
   const allDone = notDone.length === 0;
@@ -975,95 +979,75 @@ function MasterView({ ctx }) {
 
   return (
     <>
-      <Section n={secN()} title={"Last week \u2014 " + shortDate(lastWk)}
-        hint={!teamLast.anything ? "nothing was committed"
-          : teamOpenLast ? teamOpenLast + " deal" + (teamOpenLast === 1 ? "" : "s") + " never answered"
-          : "every deal answered \u00b7 " + teamLast.moved + " of " + teamLast.committed + " moved"}
-        tone={!teamLast.anything ? "flat" : (teamOpenLast ? "bad" : tone(teamLast.hitRate || 0, 0.8))}>
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>Rep</th>
-              <th className="r nar">Chose</th>
-              <th className="r nar">Moved</th>
-              <th className="r nar">Missed</th>
-              <th className="r nar">Never answered</th>
-              <th className="r nar">Closed out</th>
-            </tr>
-          </thead>
-          <tbody>
-            {activeRepsOf(data).map((r) => {
-              const lw = weekReview(data, [r.id], lastWk);
-              return (
-                <tr key={r.id}>
-                  <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
-                  {!lw.anything ? (
-                    <td className="nar faint" colSpan={5}>chose nothing last week</td>
-                  ) : (
-                    <>
-                      <td className="r nar muted">{lw.committed} &middot; {fmtMoney(lw.committedGpv)}</td>
-                      <td className="r nar strong">{lw.moved} &middot; {fmtMoney(lw.movedGpv)}</td>
-                      <td className="r nar muted">{lw.missed ? lw.missed + " \u00b7 " + fmtMoney(lw.missedGpv) : "\u2014"}</td>
-                      <td className="r nar">
-                        {lw.unlogged ? <Pill tone="bad">{lw.unlogged} &middot; {fmtMoney(lw.unloggedGpv)}</Pill> : <span className="faint">{"\u2014"}</span>}
-                      </td>
-                      <td className="r nar">
-                        {lw.unlogged ? <button className="btn" onClick={() => setTab(r.id)}>Chase</button>
-                          : <Pill tone="good">yes &middot; {Math.round((lw.hitRate || 0) * 100)}%</Pill>}
-                      </td>
-                    </>
-                  )}
-                </tr>
-              );
-            })}
-            <tr className="tot">
-              <td>Team</td>
-              {!teamLast.anything ? <td className="nar faint" colSpan={5}>nothing committed</td> : (
-                <>
-                  <td className="r nar">{teamLast.committed} &middot; {fmtMoney(teamLast.committedGpv)}</td>
-                  <td className="r nar">{teamLast.moved} &middot; {fmtMoney(teamLast.movedGpv)}</td>
-                  <td className="r nar">{teamLast.missed ? teamLast.missed + " \u00b7 " + fmtMoney(teamLast.missedGpv) : "\u2014"}</td>
-                  <td className="r nar">{teamLast.unlogged ? teamLast.unlogged + " \u00b7 " + fmtMoney(teamLast.unloggedGpv) : "\u2014"}</td>
-                  <td className="r nar">{teamLast.hitRate === null ? "\u2014" : Math.round(teamLast.hitRate * 100) + "%"}</td>
-                </>
-              )}
-            </tr>
-          </tbody>
-        </table>
-      </Section>
+      <div className="tiles">
+        <div className="tile">
+          <div className="tile-k">To move this week</div>
+          <div className="tile-v">{fmtMoney(flow.need)}</div>
+          <div className="tile-n">across {activeRepsOf(data).length} reps</div>
+        </div>
+        <div className={"tile " + tone(flow.named, flow.need)}>
+          <div className="tile-k">Chosen</div>
+          <div className="tile-v">{fmtMoney(flow.named)}</div>
+          <div className="tile-n">{teamDeals.length} deals named</div>
+        </div>
+        <div className={"tile " + tone(flow.named, flow.need)}>
+          <div className="tile-k">Progress</div>
+          <div className="tile-v">{flow.need > 0 ? Math.round((flow.named / flow.need) * 100) : 0}%</div>
+          <div className="tile-bar">
+            <span className={tone(flow.named, flow.need)}
+              style={{ width: Math.min(100, flow.need > 0 ? (flow.named / flow.need) * 100 : 0).toFixed(1) + "%" }} />
+          </div>
+        </div>
+        <div className={"tile " + (!lastScore.anything ? "flat" : (lastScore.open ? "bad" : tone(lastScore.hit, lastScore.chosen)))}>
+          <div className="tile-k">Last week</div>
+          <div className="tile-v">
+            {lastScore.anything ? lastScore.hit + " of " + lastScore.chosen : "\u2014"}
+          </div>
+          <div className="tile-n">
+            {lastScore.anything
+              ? fmtMoney(lastScore.hitGpv) + " moved" + (lastScore.open ? " \u00b7 " + lastScore.open + " never closed" : "")
+              : "nothing was chosen"}
+          </div>
+        </div>
+      </div>
 
       <Section n={secN()} title={"This week \u2014 " + shortDate(monday)}
-        hint={allDone ? "everyone is locked in"
-          : notDone.length + " of " + activeRepsOf(data).length + " reps still to lock in"}
-        tone={allDone ? "good" : "warn"}>
+        hint={teamOverdue.length
+          ? teamOverdue.length + " overdue across the team \u00b7 " + notReady.length + " of " +
+            activeRepsOf(data).length + " reps not ready"
+          : notReady.length
+            ? notReady.length + " of " + activeRepsOf(data).length + " reps still short of target"
+            : "everyone has chosen and met their target"}
+        tone={teamOverdue.length ? "bad" : (notReady.length ? "warn" : "good")}>
         <table className="tbl">
           <thead>
             <tr>
               <th>Rep</th>
+              <th className="r nar">Overdue</th>
               <th className="r nar">Deals chosen</th>
-              <th className="r nar">GPV named</th>
-              <th className="r nar">Needed</th>
-              <th className="r nar">Numbers checked</th>
-              <th className="r nar">Locked in</th>
+              <th className="r nar">GPV chosen</th>
+              <th className="r nar">Target</th>
+              <th className="r nar">Ready</th>
             </tr>
           </thead>
           <tbody>
             {activeRepsOf(data).map((r) => {
-              const w = repWeekStatus(data, r.id, monday);
               const fl = flowOf(data, [r.id], monday);
-              const named = commitsThisWeek(data, [r.id], monday).length;
-              const ready = w.done && named > 0;
+              const od = unresolvedBefore(data, [r.id], monday);
+              const chosen = commitsThisWeek(data, [r.id], monday).length;
+              const met = fl.named >= fl.need;
+              const ready = met && od.length === 0;
               return (
                 <tr key={r.id}>
                   <td><button className="lnk" onClick={() => setTab(r.id)}>{r.name}</button></td>
-                  <td className="r nar strong">{named ? named : <span className="faint">none</span>}</td>
-                  <td className={"r nar " + (fl.named > 0 ? "strong" : "faint")}>{fmtMoney(fl.named)}</td>
-                  <td className="r nar muted">{fmtMoney(fl.need)}</td>
                   <td className="r nar">
-                    <Pill tone={w.figuresDone ? "good" : (w.confirmed ? "warn" : "bad")}>
-                      {w.confirmed} of {w.ofStages}
-                    </Pill>
+                    {od.length
+                      ? <Pill tone="bad">{od.length} &middot; {fmtMoney(od.reduce((a, c) => a + (Number(c.gpv) || 0), 0))}</Pill>
+                      : <span className="faint">{"\u2014"}</span>}
                   </td>
+                  <td className="r nar strong">{chosen ? chosen : <span className="faint">none</span>}</td>
+                  <td className={"r nar " + (met ? "strong" : "")}>{fmtMoney(fl.named)}</td>
+                  <td className="r nar muted">{fmtMoney(fl.need)}</td>
                   <td className="r nar">
                     {ready ? <Pill tone="good">yes</Pill> : <button className="btn" onClick={() => setTab(r.id)}>Chase</button>}
                   </td>
@@ -1072,15 +1056,16 @@ function MasterView({ ctx }) {
             })}
             <tr className="tot">
               <td>Team</td>
+              <td className="r nar">{teamOverdue.length ? teamOverdue.length : "\u2014"}</td>
               <td className="r nar">{teamDeals.length}</td>
               <td className="r nar">{fmtMoney(flow.named)}</td>
               <td className="r nar">{fmtMoney(flow.need)}</td>
-              <td className="r nar">{activeRepsOf(data).filter((r) => repWeekStatus(data, r.id, monday).figuresDone).length} of {activeRepsOf(data).length} reps</td>
-              <td className="r nar">{activeRepsOf(data).length - notDone.length} of {activeRepsOf(data).length}</td>
+              <td className="r nar">{activeRepsOf(data).length - notReady.length} of {activeRepsOf(data).length}</td>
             </tr>
           </tbody>
         </table>
       </Section>
+
 
       <Section n={secN()} title="The funnel" open={false}
         hint="where the pipeline sits against the model">
@@ -1192,9 +1177,10 @@ function RepView({ ctx, rep }) {
   const secN = makeCounter();
   const status = repWeekStatus(data, rep.id, monday);
   const weekDeals = commitsThisWeek(data, [rep.id], monday);
-  const lastWk = lastMondayOf(monday);
-  const myLast = weekReview(data, [rep.id], lastWk);
-  const lastDeals = commitsThisWeek(data, [rep.id], lastWk);
+  const overdue = unresolvedBefore(data, [rep.id], monday)
+    .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
+  const overdueGpv = overdue.reduce((a, c) => a + (Number(c.gpv) || 0), 0);
+  const hitTarget = flow.named >= flow.need;
   const carried = unresolvedBefore(data, [rep.id], monday)
     .sort((a, b) => String(a.weekOf).localeCompare(String(b.weekOf)));
   /* only worth showing while it is still recent enough to argue with */
@@ -1212,76 +1198,47 @@ function RepView({ ctx, rep }) {
 
   return (
     <>
-      <Section n={secN()} title={"Last week \u2014 " + shortDate(lastWk)}
-        hint={!lastDeals.length ? "nothing was chosen"
-          : carried.length ? carried.length + " still to answer"
-          : "closed out \u00b7 " + myLast.moved + " of " + myLast.committed + " moved"}
-        tone={carried.length ? "bad" : (!lastDeals.length ? "flat" : tone(myLast.hitRate || 0, 0.8))}>
-        {lastDeals.length ? (
+      {overdue.length ? (
+        <Section n={secN()} title="Overdue"
+          hint={overdue.length + " deal" + (overdue.length === 1 ? "" : "s") +
+                " from earlier weeks still open \u2014 " + fmtMoney(overdueGpv) + ". Close these first."}
+          tone="bad">
           <table className="tbl">
             <thead>
-              <tr>
-                <th>Deal</th>
-                <th className="nar">Move</th>
-                <th className="r nar">GPV</th>
-                <th className="r">Outcome</th>
-              </tr>
+              <tr><th>Deal</th><th className="nar">Move</th><th className="nar">Chosen</th>
+                <th className="r nar">GPV</th><th className="r">Did it move?</th></tr>
             </thead>
             <tbody>
-              {lastDeals.map((c2) => (
+              {overdue.map((c2) => (
                 <tr key={c2.id}>
                   <td>{c2.name || <span className="faint">unnamed</span>}</td>
                   <td className="nar muted">{ctx.stageName(c2.fromStage)} {"\u2192"} {ctx.stageName(c2.toStage)}</td>
+                  <td className="nar faint">{shortDate(c2.weekOf)}</td>
                   <td className="r nar strong">{fmtMoney(c2.gpv)}</td>
                   <td className="r">
-                    {c2.status === "open" ? (
-                      <span className="acts">
-                        <button className="btn ok" onClick={() => actions.resolveCommit(c2.id, "moved")}>Moved</button>
-                        <button className="btn no" onClick={() => actions.rollCommit(c2.id)}
-                          title="Records the miss and re-commits the deal for this week">Missed, still on it</button>
-                        <button className="btn no" onClick={() => actions.resolveCommit(c2.id, "missed")}>Missed, parked</button>
-                        <button className="btn kill" onClick={() => actions.resolveCommit(c2.id, "dead")}>Dead</button>
-                      </span>
-                    ) : (
-                      <span className="acts">
-                        <span className={"tag " + c2.status}>{c2.status}</span>
-                        {c2.autoMissed ? <span className="tag">auto</span> : null}
-                        <button className="btn x" onClick={() => actions.reopenCommit(c2.id)}>undo</button>
-                      </span>
-                    )}
+                    <span className="acts">
+                      <button className="btn ok" onClick={() => actions.resolveCommit(c2.id, "moved")}>Hit</button>
+                      <button className="btn no" onClick={() => actions.rollCommit(c2.id)}
+                        title="Records the miss and carries the deal into this week">Missed</button>
+                      <button className="btn kill" onClick={() => actions.resolveCommit(c2.id, "dead")}>Dead</button>
+                    </span>
                   </td>
                 </tr>
               ))}
-              <tr className="tot">
-                <td>{myLast.moved} of {myLast.committed} moved</td>
-                <td className="nar" />
-                <td className="r nar">{fmtMoney(myLast.movedGpv)}</td>
-                <td className="r">
-                  {myLast.hitRate === null
-                    ? <span className="faint">not answered yet</span>
-                    : <Pill tone={tone(myLast.hitRate, 0.8)}>{Math.round(myLast.hitRate * 100)}% hit rate</Pill>}
-                </td>
-              </tr>
             </tbody>
           </table>
-        ) : (
-          <div className="deal-empty">No deals were chosen for the week of {shortDate(lastWk)}.</div>
-        )}
-      </Section>
+        </Section>
+      ) : null}
 
       <Section n={secN()} title={"This week \u2014 " + shortDate(monday)}
         hint={!weekDeals.length ? "no deals chosen yet"
-          : status.figuresDone ? "locked in \u00b7 " + fmtMoney(flow.named) + " of " + fmtMoney(flow.need)
-          : status.ofStages - status.confirmed + " stages still to check"}
-        tone={weekDeals.length && status.figuresDone ? "good" : "warn"}>
+          : hitTarget ? weekDeals.length + " deals \u00b7 " + fmtMoney(flow.named) + " chosen, target met"
+          : weekDeals.length + " deals \u00b7 " + fmtMoney(flow.need - flow.named) + " short of the target"}
+        tone={!weekDeals.length ? "bad" : (hitTarget ? "good" : "warn")}>
         <table className="tbl">
           <thead>
-            <tr>
-              <th>Deal</th>
-              <th className="nar">Move</th>
-              <th className="r nar">GPV</th>
-              <th className="r">Outcome</th>
-            </tr>
+            <tr><th>Deal</th><th className="nar">Move</th><th className="r nar">GPV</th>
+              <th className="r">Did it move?</th></tr>
           </thead>
           <tbody>
             {weekDeals.length ? weekDeals.map((c2) => (
@@ -1292,56 +1249,36 @@ function RepView({ ctx, rep }) {
                 <td className="r">
                   {c2.status === "open" ? (
                     <span className="acts">
-                      <button className="btn ok" onClick={() => actions.resolveCommit(c2.id, "moved")}>Moved</button>
+                      <button className="btn ok" onClick={() => actions.resolveCommit(c2.id, "moved")}>Hit</button>
                       <button className="btn no" onClick={() => actions.rollCommit(c2.id)}
-                        title="Records the miss and re-commits the deal for next week">Missed, still on it</button>
-                      <button className="btn no" onClick={() => actions.resolveCommit(c2.id, "missed")}>Missed, parked</button>
+                        title="Records the miss and carries the deal into next week">Missed</button>
                       <button className="btn kill" onClick={() => actions.resolveCommit(c2.id, "dead")}>Dead</button>
                     </span>
                   ) : (
                     <span className="acts">
-                      <span className={"tag " + c2.status}>{c2.status}</span>
+                      <span className={"tag " + c2.status}>{c2.status === "moved" ? "hit" : c2.status}</span>
                       <button className="btn x" onClick={() => actions.reopenCommit(c2.id)}>undo</button>
                     </span>
                   )}
                 </td>
               </tr>
             )) : (
-              <tr>
-                <td colSpan={4} className="faint" style={{ padding: "16px 0" }}>
-                  Nothing chosen yet. Pick deals in the funnel below.
-                </td>
-              </tr>
+              <tr><td colSpan={4} className="faint" style={{ padding: "18px 0" }}>
+                Nothing chosen yet. Pick deals in the funnel below.
+              </td></tr>
             )}
             <tr className="tot">
               <td>{weekDeals.length} chosen</td>
               <td className="nar" />
               <td className="r nar">{fmtMoney(flow.named)}</td>
               <td className="r">
-                <Pill tone={tone(flow.named, flow.need)}>of {fmtMoney(flow.need)} needed</Pill>
+                <Pill tone={hitTarget ? "good" : "warn"}>
+                  {hitTarget ? "target met" : fmtMoney(flow.need - flow.named) + " short of " + fmtMoney(flow.need)}
+                </Pill>
               </td>
             </tr>
           </tbody>
         </table>
-        <div className="grp">
-          <div className="grp-h">
-            <span className="grp-t">Stage numbers checked</span>
-            <span className={"grp-n tone-" + (status.figuresDone ? "good" : (status.confirmed ? "warn" : "bad"))}>
-              {status.confirmed} of {status.ofStages}
-            </span>
-          </div>
-          {status.figuresDone ? (
-            <p className="deal-empty" style={{ paddingTop: "6px" }}>
-              All {status.ofStages} stages confirmed current for this week.
-            </p>
-          ) : (
-            <p className="deal-empty" style={{ paddingTop: "6px" }}>
-              GPV and days carry over, so tick each stage in the funnel below once checked.
-              <button className="btn" style={{ marginLeft: "12px" }}
-                onClick={() => actions.confirmAllStages(rep.id)}>All {status.ofStages} are right</button>
-            </p>
-          )}
-        </div>
       </Section>
 
 
@@ -2081,9 +2018,11 @@ export default function App() {
     /* Did not happen, but still live: the old commitment is recorded as missed
        in its own week and a fresh one is made for this week. Honest on both
        counts, and the rep does not retype the deal. */
-    /* Missed, but still being worked. The old commitment is recorded as a miss
-       in its own week and a fresh one is created, so the deal is never retyped
-       and the hit rate stays honest.
+    /* Missed. The deal did not move but is still being worked, so it is
+       recorded as a miss in its own week and re-committed automatically. This
+       is the only missed outcome: four buttons could not be read at a glance,
+       a deal that is genuinely finished is Dead, and one entered by mistake is
+       deleted. The rep never retypes anything.
 
        Where the new one lands: the week after the one it failed in, or this
        week, whichever is later. Missed last week, it reappears in this week's
@@ -2557,6 +2496,24 @@ main{max-width:1180px;margin:0 auto;padding:8px 24px 96px}
 .card.bad .card-pct{color:var(--bad)}
 .card-n{font-size:11.5px;color:var(--faint);font-weight:600}
 @media (max-width:620px){.cards{grid-template-columns:1fr 1fr;gap:10px}.card-v{font-size:21px}}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:22px}
+.tile{background:var(--card);border-radius:var(--r-sm);box-shadow:var(--shadow);padding:18px 20px;
+  border-left:4px solid var(--line-2)}
+.tile.good{border-left-color:var(--good)}
+.tile.warn{border-left-color:var(--warn)}
+.tile.bad{border-left-color:var(--bad)}
+.tile.flat{border-left-color:var(--line-2)}
+.tile-k{font-size:11.5px;font-weight:750;letter-spacing:.02em;color:var(--slate);text-transform:uppercase}
+.tile-v{font-size:28px;font-weight:800;letter-spacing:-.03em;margin-top:8px;line-height:1.05}
+.tile.good .tile-v{color:var(--good)}
+.tile.warn .tile-v{color:var(--warn)}
+.tile.bad .tile-v{color:var(--bad)}
+.tile-n{font-size:12px;color:var(--faint);font-weight:600;margin-top:5px}
+.tile-bar{position:relative;height:6px;border-radius:999px;background:var(--track);margin-top:11px;overflow:hidden}
+.tile-bar span{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:var(--good-bar)}
+.tile-bar span.warn{background:var(--warn-bar)}
+.tile-bar span.bad{background:var(--bad-bar)}
+@media (max-width:620px){.tiles{grid-template-columns:1fr 1fr;gap:10px}.tile-v{font-size:22px}}
 .tbl tr.tot td{border-top:1.5px solid var(--line-2);font-weight:800;padding-top:14px;color:var(--ink)}
 .grp{padding:2px 0 4px}
 .grp + .grp{margin-top:22px;border-top:1px solid var(--line);padding-top:18px}
